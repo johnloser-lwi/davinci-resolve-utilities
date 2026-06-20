@@ -58,40 +58,6 @@ def tc_str_to_frame(tc_str, fps):
     return ((h * 3600 + m * 60 + s) * round(float(fps))) + f
 
 
-def consolidate_green_clips(timeline, media_pool):
-    top_track = timeline.GetTrackCount("video")
-
-    to_move = []
-    for track_idx in range(1, top_track):
-        items = timeline.GetItemListInTrack("video", track_idx)
-        if not items:
-            continue
-        for item in items:
-            if item.GetClipColor() == "Green":
-                to_move.append(item)
-
-    for item in to_move:
-        record_frame = item.GetStart()
-        source_item = item.GetMediaPoolItem()
-        total_frames = int(source_item.GetClipProperty("Frames"))
-
-        timeline.DeleteClips([item])
-
-        clip_info = {
-            "mediaPoolItem": source_item,
-            "startFrame": 0,
-            "endFrame": total_frames,
-            "mediaType": 1,
-            "trackIndex": top_track,
-            "recordFrame": record_frame,
-        }
-        placed = media_pool.AppendToTimeline([clip_info])
-        if placed and placed[0]:
-            placed[0].SetClipColor("Green")
-            print(f"Moved green clip to track {top_track} at frame {record_frame}.")
-        else:
-            print(f"Warning: Could not move green clip at frame {record_frame} to top track.")
-
 
 resolve = bmd.scriptapp("Resolve")
 fusion = resolve.Fusion()
@@ -177,8 +143,18 @@ else:
 
                         media_pool.SetCurrentFolder(preview_bin)
 
-                        render_path = target_dir.rstrip("/\\") + "/" + custom_name + ".mov"
-                        imported = media_pool.ImportMedia([render_path])
+                        # Find the rendered file by name regardless of extension
+                        render_path = None
+                        for f in os.listdir(target_dir):
+                            if os.path.splitext(f)[0] == custom_name:
+                                render_path = os.path.join(target_dir, f)
+                                break
+
+                        if not render_path:
+                            print(f"Error: Could not find rendered file '{custom_name}' in '{target_dir}'.")
+                            imported = None
+                        else:
+                            imported = media_pool.ImportMedia([render_path])
 
                         if not imported:
                             print(f"Warning: Could not import '{render_path}' into media pool.")
@@ -193,9 +169,19 @@ else:
                             start_tc_str = clip.GetClipProperty("Start TC")
                             record_frame = tc_str_to_frame(start_tc_str, fps)
 
-                            # Add a new video track on top then place the clip onto it
-                            timeline.AddTrack("video")
-                            top_track = timeline.GetTrackCount("video")
+                            # Find the highest track with any clip overlapping the range
+                            clip_end = record_frame + clip_total_frames
+                            total_tracks = timeline.GetTrackCount("video")
+                            highest_occupied = 0
+                            for track_idx in range(1, total_tracks + 1):
+                                items = timeline.GetItemListInTrack("video", track_idx) or []
+                                if any(item.GetStart() < clip_end and item.GetEnd() > record_frame for item in items):
+                                    highest_occupied = track_idx
+
+                            target_track = highest_occupied + 1
+                            if target_track > total_tracks:
+                                timeline.AddTrack("video")
+                            top_track = target_track
 
                             clip_info = {
                                 "mediaPoolItem": clip,
@@ -214,9 +200,6 @@ else:
                             else:
                                 timeline_item.SetClipColor("Green")
                                 print(f"Placed on video track {top_track} at frame {record_frame} and colored green.")
-
-                            print("Consolidating green clips to top track...")
-                            consolidate_green_clips(timeline, media_pool)
 
                             timeline.SetCurrentTimecode(playhead_tc)
                             print(f"Playhead restored to {playhead_tc}.")

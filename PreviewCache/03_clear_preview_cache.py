@@ -20,15 +20,15 @@ else:
         if not items:
             continue
         for item in items:
-            if item.GetClipColor() == "Green":
+            if item.GetClipColor() in ("Green", "Chocolate"):
                 green_clips.append(item)
 
     if green_clips:
         timeline.DeleteClips(green_clips)
         removed_from_timeline = len(green_clips)
-        print(f"Removed {removed_from_timeline} green clip(s) from timeline.")
+        print(f"Removed {removed_from_timeline} PreviewCache clip(s) from timeline.")
     else:
-        print("No green clips found on timeline.")
+        print("No PreviewCache clips found on timeline.")
 
     # --- Delete items from the PreviewCache bin and source files from disk ---
     root_folder = media_pool.GetRootFolder()
