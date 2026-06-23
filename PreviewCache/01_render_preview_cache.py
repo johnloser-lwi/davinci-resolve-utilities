@@ -5,7 +5,11 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
 
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\preview_cache_prefs.json")
+if os.name == "nt":
+    PREFS_FILE = os.path.join(os.environ["APPDATA"], "preview_cache_prefs.json")
+else:
+    PREFS_FILE = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
+                              "preview_cache_prefs.json")
 
 
 def load_prefs():
