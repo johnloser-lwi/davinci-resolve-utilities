@@ -11,8 +11,16 @@ media_pool = project.GetMediaPool()
 
 
 def tc_str_to_frame(tc_str, fps):
-    h, m, s, f = map(int, tc_str.split(":"))
-    return ((h * 3600 + m * 60 + s) * round(float(fps))) + f
+    drop_frame = ";" in tc_str
+    h, m, s, f = map(int, tc_str.replace(";", ":").split(":"))
+    fps_round = round(float(fps))
+    total = (h * 3600 + m * 60 + s) * fps_round + f
+    if drop_frame:
+        # Subtract the frames that were dropped (2 per minute, except every 10th minute)
+        drop = 4 if fps_round == 60 else 2
+        total_minutes = 60 * h + m
+        total -= drop * (total_minutes - total_minutes // 10)
+    return total
 
 
 if not timeline:

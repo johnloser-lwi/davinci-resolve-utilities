@@ -58,8 +58,15 @@ def ask_preset(preset_names, last_preset=None):
 
 
 def tc_str_to_frame(tc_str, fps):
-    h, m, s, f = map(int, tc_str.split(":"))
-    return ((h * 3600 + m * 60 + s) * round(float(fps))) + f
+    drop_frame = ";" in tc_str
+    h, m, s, f = map(int, tc_str.replace(";", ":").split(":"))
+    fps_round = round(float(fps))
+    total = (h * 3600 + m * 60 + s) * fps_round + f
+    if drop_frame:
+        drop = 4 if fps_round == 60 else 2
+        total_minutes = 60 * h + m
+        total -= drop * (total_minutes - total_minutes // 10)
+    return total
 
 
 
