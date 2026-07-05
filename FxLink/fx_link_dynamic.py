@@ -154,7 +154,13 @@ try {
     var rqNote = "";
     try {
         var rqItem = proj.renderQueue.items.add(comp);
-        rqItem.outputModule(1).file = new File("__OUT_FILE__");
+        var om = rqItem.outputModule(1);
+        try {
+            om.applyTemplate("FxLink");
+        } catch (te) {
+            rqNote = " (Output Module template 'FxLink' not found - using default settings)";
+        }
+        om.file = new File("__OUT_FILE__");
     } catch (e) {
         rqNote = " (render queue setup failed: " + e.toString() + ")";
     }

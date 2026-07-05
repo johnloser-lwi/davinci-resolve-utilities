@@ -28,3 +28,29 @@ foreach ($file in $scripts) {
 
 Write-Host "`nDone. $copied script(s) deployed to:"
 Write-Host "  $dest"
+
+# --- Deploy .jsx scripts to After Effects (newest version found) ---
+$jsxScripts = Get-ChildItem -Path $source -Recurse -Filter "*.jsx"
+if ($jsxScripts.Count -gt 0) {
+    $aeDirs = Get-ChildItem -Path "C:\Program Files\Adobe" -Directory -Filter "Adobe After Effects *" -ErrorAction SilentlyContinue | Sort-Object Name
+    if ($aeDirs.Count -eq 0) {
+        Write-Host "`nNo After Effects installation found - skipped .jsx deployment."
+    } else {
+        $aeScripts = Join-Path $aeDirs[-1].FullName "Support Files\Scripts"
+        $jsxCopied = 0
+        foreach ($file in $jsxScripts) {
+            try {
+                Copy-Item -Path $file.FullName -Destination (Join-Path $aeScripts $file.Name) -Force -ErrorAction Stop
+                Write-Host "Deployed to AE: $($file.Name)"
+                $jsxCopied++
+            } catch {
+                Write-Host "WARNING: Could not copy '$($file.Name)' to '$aeScripts' (needs admin rights)."
+                Write-Host "  Either run this deploy script elevated once, or run the .jsx from AE via File > Scripts > Run Script File."
+            }
+        }
+        if ($jsxCopied -gt 0) {
+            Write-Host "$jsxCopied .jsx script(s) deployed to:"
+            Write-Host "  $aeScripts"
+        }
+    }
+}
