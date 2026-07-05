@@ -83,10 +83,16 @@ def afterfx_running():
 
 def run_extendscript(afterfx_exe, jsx_code, timeout=20):
     """Run ExtendScript in the running AE instance; returns contents of the
-    result file the script writes, or None on timeout."""
+    result file the script writes, or None on timeout.
+
+    The JSX writes to a .part file and renames it when done, so the result
+    file only ever appears complete. We also wait for the AfterFX launcher
+    process to exit before returning, so back-to-back calls can't collide
+    and trigger AE's "only one script can be run at a time" warning."""
     result_path = os.path.join(tempfile.gettempdir(), f"fxlink_ae_result_{os.getpid()}.txt")
-    if os.path.exists(result_path):
-        os.remove(result_path)
+    for stale in (result_path, result_path + ".part"):
+        if os.path.exists(stale):
+            os.remove(stale)
 
     # JSX paths must use forward slashes
     jsx = jsx_code.replace("__RESULT_FILE__", result_path.replace("\\", "/"))
@@ -96,23 +102,31 @@ def run_extendscript(afterfx_exe, jsx_code, timeout=20):
         f.write(jsx)
 
     # -r forwards the script to the already-running AE instance
-    subprocess.Popen([afterfx_exe, "-r", jsx_path])
+    launcher = subprocess.Popen([afterfx_exe, "-r", jsx_path])
 
+    result = None
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(result_path):
-            time.sleep(0.2)  # let AE finish writing
             with open(result_path, "r", encoding="utf-8") as f:
                 result = f.read().strip()
             os.remove(result_path)
             os.remove(jsx_path)
-            return result
+            break
         time.sleep(0.25)
-    return None
+
+    # Don't return until the launcher process is gone, otherwise the next
+    # AfterFX.exe -r call can race against this one inside AE.
+    try:
+        launcher.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+
+    return result
 
 
 GET_PROJECT_JSX = """
-var f = new File("__RESULT_FILE__");
+var f = new File("__RESULT_FILE__" + ".part");
 f.encoding = "UTF-8";
 f.open("w");
 if (app.project && app.project.file) {
@@ -121,10 +135,11 @@ if (app.project && app.project.file) {
     f.write("__UNSAVED__");
 }
 f.close();
+f.rename(File("__RESULT_FILE__").name);
 """
 
 SETUP_PROJECT_JSX = """
-var f = new File("__RESULT_FILE__");
+var f = new File("__RESULT_FILE__" + ".part");
 f.encoding = "UTF-8";
 f.open("w");
 try {
@@ -170,6 +185,7 @@ try {
     f.write("ERROR: " + e.toString());
 }
 f.close();
+f.rename(File("__RESULT_FILE__").name);
 """
 
 
