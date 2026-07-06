@@ -60,6 +60,33 @@ def ask_preset(preset_names, last_preset=None):
     return selected[0]
 
 
+def tc_str_to_frame(tc_str, fps):
+    drop_frame = ";" in tc_str
+    h, m, s, f = map(int, tc_str.replace(";", ":").split(":"))
+    fps_round = round(float(fps))
+    total = (h * 3600 + m * 60 + s) * fps_round + f
+    if drop_frame:
+        drop = 4 if fps_round == 60 else 2
+        total_minutes = 60 * h + m
+        total -= drop * (total_minutes - total_minutes // 10)
+    return total
+
+
+def find_linked_comp_under_playhead(timeline):
+    """If a Pink FxLink clip sits under the playhead, return its comp name
+    (the linked file's basename without extension), else None."""
+    fps = timeline.GetSetting("timelineFrameRate") or 24
+    playhead = tc_str_to_frame(timeline.GetCurrentTimecode(), fps)
+    for track_idx in range(timeline.GetTrackCount("video"), 0, -1):
+        for item in timeline.GetItemListInTrack("video", track_idx) or []:
+            if item.GetClipColor() == CLIP_COLOR and item.GetStart() <= playhead < item.GetEnd():
+                source = item.GetMediaPoolItem()
+                file_path = source.GetClipProperty("File Path") if source else ""
+                if file_path:
+                    return os.path.splitext(os.path.basename(file_path))[0]
+    return None
+
+
 def find_afterfx(prefs):
     cached = prefs.get("afterfx_path")
     if cached and os.path.exists(cached):
@@ -138,6 +165,31 @@ f.close();
 f.rename(File("__RESULT_FILE__").name);
 """
 
+OPEN_COMP_JSX = """
+var f = new File("__RESULT_FILE__" + ".part");
+f.encoding = "UTF-8";
+f.open("w");
+try {
+    var proj = app.project;
+    var comp = null;
+    for (var i = 1; i <= proj.numItems; i++) {
+        var it = proj.item(i);
+        if (it instanceof CompItem && it.name === "__COMP_NAME__") { comp = it; break; }
+    }
+    if (comp) {
+        comp.openInViewer();
+        app.activate();
+        f.write("OK");
+    } else {
+        f.write("NOT_FOUND");
+    }
+} catch (e) {
+    f.write("ERROR: " + e.toString());
+}
+f.close();
+f.rename(File("__RESULT_FILE__").name);
+"""
+
 SETUP_PROJECT_JSX = """
 var f = new File("__RESULT_FILE__" + ".part");
 f.encoding = "UTF-8";
@@ -166,21 +218,7 @@ try {
     comp.layers.add(footage);
     comp.openInViewer();
 
-    var rqNote = "";
-    try {
-        var rqItem = proj.renderQueue.items.add(comp);
-        var om = rqItem.outputModule(1);
-        try {
-            om.applyTemplate("FxLink");
-        } catch (te) {
-            rqNote = " (Output Module template 'FxLink' not found - using default settings)";
-        }
-        om.file = new File("__OUT_FILE__");
-    } catch (e) {
-        rqNote = " (render queue setup failed: " + e.toString() + ")";
-    }
-
-    f.write("OK" + rqNote);
+    f.write("OK");
 } catch (e) {
     f.write("ERROR: " + e.toString());
 }
@@ -203,10 +241,23 @@ else:
     prefs = load_prefs()
 
     afterfx_exe = find_afterfx(prefs)
+    linked_comp = find_linked_comp_under_playhead(timeline)
+
     if not afterfx_exe:
         print("Error: Could not find AfterFX.exe under C:\\Program Files\\Adobe.")
     elif not afterfx_running():
         print("Error: After Effects is not running. Open your AE project first.")
+    elif linked_comp:
+        print(f"FxLink clip under playhead -> opening comp '{linked_comp}' in After Effects...")
+        result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
+        if result == "OK":
+            print("Comp opened in After Effects.")
+        elif result == "NOT_FOUND":
+            print(f"Comp '{linked_comp}' was not found in the open AE project. Is the right project open?")
+        elif result is None:
+            print("Error: After Effects did not respond. Is it busy with a modal dialog?")
+        else:
+            print(f"Error from AE: {result}")
     else:
         presets_dict = project.GetRenderPresets()
         preset_names = [presets_dict[k] for k in sorted(presets_dict.keys())]
@@ -369,17 +420,13 @@ else:
 
                                 # --- Everything in Resolve is done; now set up the AE project ---
                                 print("Setting up After Effects project...")
-                                setup_jsx = (
-                                    SETUP_PROJECT_JSX
-                                    .replace("__SRC_FILE__", render_path.replace("\\", "/"))
-                                    .replace("__OUT_FILE__", output_path.replace("\\", "/"))
-                                )
+                                setup_jsx = SETUP_PROJECT_JSX.replace("__SRC_FILE__", render_path.replace("\\", "/"))
                                 ae_result = run_extendscript(afterfx_exe, setup_jsx, timeout=30)
 
                                 if ae_result is None:
                                     print("Warning: AE did not confirm project setup (timeout). Check AE manually.")
                                 elif ae_result.startswith("OK"):
-                                    print(f"AE ready: comp created and render queued to overwrite the Output file.{ae_result[2:]}")
-                                    print("Work in AE, then just hit Render — Resolve links to the Output file and will pick up the overwrite.")
+                                    print("AE ready: comp created and opened.")
+                                    print("Work in AE, then select the comp and run FxLink Export to overwrite the Output file — Resolve will pick it up.")
                                 else:
                                     print(f"Warning: AE setup failed: {ae_result}")
