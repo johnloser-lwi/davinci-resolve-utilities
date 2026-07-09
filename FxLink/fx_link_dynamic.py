@@ -288,10 +288,10 @@ else:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 custom_name = f"{timeline_name}_FxLink_tmp_{timestamp}"
 
+                # No ExportAudio override — the selected preset decides.
                 project.SetRenderSettings({
                     "SelectAllFrames": False,
                     "TargetDir": STAGING_DIR,
-                    "ExportAudio": False,
                     "CustomName": custom_name,
                 })
 
