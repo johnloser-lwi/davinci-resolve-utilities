@@ -88,9 +88,8 @@
               "Output Module dropdown choose 'Make Template...' and name it exactly '" + TEMPLATE_NAME + "'.");
     }
 
-    proj.renderQueue.render();
-
-    alert("FxLink Export: Rendered " + queued.length + " comp(s) to:\n" + outputDir.fsName + "\n\n" +
-          queued.join("\n") + "\n\n" +
-          "If Resolve doesn't show the update, run fx_link_refresh there.");
+    // Rendering from a script blocks AE's UI (frozen progress bar), so just
+    // queue everything and let the user press Render for live progress.
+    // No success popup — the opened Render Queue panel is the feedback.
+    proj.renderQueue.showWindow(true);
 })();

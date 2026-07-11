@@ -40,6 +40,9 @@ if ($jsxScripts.Count -gt 0) {
         $jsxCopied = 0
         foreach ($file in $jsxScripts) {
             try {
+                if (-not (Test-Path $aeScripts)) {
+                    New-Item -ItemType Directory -Path $aeScripts -Force -ErrorAction Stop | Out-Null
+                }
                 Copy-Item -Path $file.FullName -Destination (Join-Path $aeScripts $file.Name) -Force -ErrorAction Stop
                 Write-Host "Deployed to AE: $($file.Name)"
                 $jsxCopied++
