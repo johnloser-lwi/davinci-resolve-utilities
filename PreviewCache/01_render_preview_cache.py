@@ -83,8 +83,17 @@ else:
     project_name = project.GetName()
     playhead_tc = timeline.GetCurrentTimecode()
 
+    # Start the folder picker at <Project Media folder>\PreviewCache (created
+    # if missing), based on the project setting. Falls back to a plain picker
+    # if no project media location is configured.
+    default_dir = None
+    media_location = project.GetSetting("projectMediaLocation")
+    if media_location:
+        default_dir = os.path.join(media_location, "PreviewCache")
+        os.makedirs(default_dir, exist_ok=True)
+
     print("Please select the render output folder...")
-    target_dir = fusion.RequestDir()
+    target_dir = fusion.RequestDir(default_dir + os.sep) if default_dir else fusion.RequestDir()
 
     if not target_dir:
         print("Cancelled: No render path selected.")
