@@ -10,10 +10,13 @@ media_pool = project.GetMediaPool()
 if not timeline:
     print("Error: No timeline is currently open.")
 else:
-    # --- Remove green clips from the timeline ---
-    removed_from_timeline = 0
+    # --- Find color-labeled preview cache clips on the timeline ---
+    # Only clips carrying the cache color label are treated as preview cache.
+    # Their source file paths determine what may be deleted from the bin and
+    # disk — anything else in the PreviewCache bin is never touched.
     track_count = timeline.GetTrackCount("video")
-    green_clips = []
+    cache_clips = []
+    cache_paths = set()
 
     for track_idx in range(1, track_count + 1):
         items = timeline.GetItemListInTrack("video", track_idx)
@@ -21,16 +24,19 @@ else:
             continue
         for item in items:
             if item.GetClipColor() in ("Green", "Chocolate"):
-                green_clips.append(item)
+                cache_clips.append(item)
+                source = item.GetMediaPoolItem()
+                path = source.GetClipProperty("File Path") if source else ""
+                if path:
+                    cache_paths.add(path)
 
-    if green_clips:
-        timeline.DeleteClips(green_clips)
-        removed_from_timeline = len(green_clips)
-        print(f"Removed {removed_from_timeline} PreviewCache clip(s) from timeline.")
+    if cache_clips:
+        timeline.DeleteClips(cache_clips)
+        print(f"Removed {len(cache_clips)} PreviewCache clip(s) from timeline.")
     else:
         print("No PreviewCache clips found on timeline.")
 
-    # --- Delete items from the PreviewCache bin and source files from disk ---
+    # --- Delete only the matching items from the PreviewCache bin and disk ---
     root_folder = media_pool.GetRootFolder()
     preview_bin = None
     for folder in root_folder.GetSubFolderList():
@@ -40,19 +46,28 @@ else:
 
     if not preview_bin:
         print("No PreviewCache bin found in media pool.")
+    elif not cache_paths:
+        print("Nothing to delete from the PreviewCache bin.")
     else:
-        items = preview_bin.GetClipList()
-        if not items:
-            print("PreviewCache bin is already empty.")
-        else:
-            file_paths = []
-            for item in items:
-                path = item.GetClipProperty("File Path")
-                if path:
-                    file_paths.append(path)
+        bin_items = preview_bin.GetClipList() or []
+        to_delete = []
+        skipped = 0
+        for item in bin_items:
+            path = item.GetClipProperty("File Path")
+            if path in cache_paths:
+                to_delete.append(item)
+            else:
+                skipped += 1
 
-            media_pool.DeleteClips(items)
-            print(f"Removed {len(items)} item(s) from PreviewCache bin.")
+        if skipped:
+            print(f"Left {skipped} unrelated item(s) in the PreviewCache bin untouched.")
+
+        if not to_delete:
+            print("No matching preview cache items found in the bin.")
+        else:
+            file_paths = [item.GetClipProperty("File Path") for item in to_delete]
+            media_pool.DeleteClips(to_delete)
+            print(f"Removed {len(to_delete)} item(s) from PreviewCache bin.")
 
             deleted_files = 0
             for path in file_paths:
