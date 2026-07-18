@@ -72,9 +72,9 @@ def tc_str_to_frame(tc_str, fps):
     return total
 
 
-def find_linked_comp_under_playhead(timeline):
-    """If a Pink FxLink clip sits under the playhead, return its comp name
-    (the linked file's basename without extension), else None."""
+def find_linked_clip_path_under_playhead(timeline):
+    """If a Pink FxLink clip sits under the playhead, return its linked file
+    path, else None."""
     fps = timeline.GetSetting("timelineFrameRate") or 24
     playhead = tc_str_to_frame(timeline.GetCurrentTimecode(), fps)
     for track_idx in range(timeline.GetTrackCount("video"), 0, -1):
@@ -83,8 +83,31 @@ def find_linked_comp_under_playhead(timeline):
                 source = item.GetMediaPoolItem()
                 file_path = source.GetClipProperty("File Path") if source else ""
                 if file_path:
-                    return os.path.splitext(os.path.basename(file_path))[0]
+                    return file_path
     return None
+
+
+def find_any_pink_clip_path(timeline):
+    """Return the linked file path of the first Pink FxLink clip found
+    anywhere on the timeline, else None. Used to map to the AE project."""
+    for track_idx in range(timeline.GetTrackCount("video"), 0, -1):
+        for item in timeline.GetItemListInTrack("video", track_idx) or []:
+            if item.GetClipColor() == CLIP_COLOR:
+                source = item.GetMediaPoolItem()
+                file_path = source.GetClipProperty("File Path") if source else ""
+                if file_path:
+                    return file_path
+    return None
+
+
+def find_aep_for_output(file_path):
+    """The linked file lives in <aep folder>\\Output\\, so the .aep sits one
+    level up. Returns the newest .aep there, or None."""
+    project_dir = os.path.dirname(os.path.dirname(file_path))
+    aeps = glob.glob(os.path.join(project_dir, "*.aep"))
+    if not aeps:
+        return None
+    return max(aeps, key=os.path.getmtime)
 
 
 def find_afterfx(prefs):
@@ -165,6 +188,20 @@ f.close();
 f.rename(File("__RESULT_FILE__").name);
 """
 
+OPEN_PROJECT_JSX = """
+var f = new File("__RESULT_FILE__" + ".part");
+f.encoding = "UTF-8";
+f.open("w");
+try {
+    app.open(new File("__AEP_FILE__"));
+    f.write("OK");
+} catch (e) {
+    f.write("ERROR: " + e.toString());
+}
+f.close();
+f.rename(File("__RESULT_FILE__").name);
+"""
+
 OPEN_COMP_JSX = """
 var f = new File("__RESULT_FILE__" + ".part");
 f.encoding = "UTF-8";
@@ -227,6 +264,37 @@ f.rename(File("__RESULT_FILE__").name);
 """
 
 
+def ensure_ae_project(afterfx_exe, aep_path, timeout=90):
+    """Make sure AE is running with aep_path open — launching AE or switching
+    projects as needed. Returns True once AE reports the expected project."""
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p))
+
+    if not afterfx_running():
+        print(f"Launching After Effects with {os.path.basename(aep_path)} ...")
+        subprocess.Popen([afterfx_exe, aep_path])
+    else:
+        current = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
+        if current and current != "__UNSAVED__" and norm(current) == norm(aep_path):
+            return True
+        print(f"Switching After Effects to {os.path.basename(aep_path)} ...")
+        open_jsx = OPEN_PROJECT_JSX.replace("__AEP_FILE__", aep_path.replace("\\", "/"))
+        result = run_extendscript(afterfx_exe, open_jsx, timeout=60)
+        if result != "OK":
+            print(f"Error: Could not open the project in After Effects: {result}")
+            return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        current = run_extendscript(afterfx_exe, GET_PROJECT_JSX, timeout=10)
+        if current and current != "__UNSAVED__" and norm(current) == norm(aep_path):
+            return True
+        time.sleep(3)
+
+    print("Error: After Effects did not load the expected project in time.")
+    return False
+
+
 resolve = bmd.scriptapp("Resolve")
 fusion = resolve.Fusion()
 
@@ -241,24 +309,45 @@ else:
     prefs = load_prefs()
 
     afterfx_exe = find_afterfx(prefs)
-    linked_comp = find_linked_comp_under_playhead(timeline)
+    linked_path = find_linked_clip_path_under_playhead(timeline)
+
+    ae_running = afterfx_running()
+    aep_hint = None
+    if not ae_running and not linked_path:
+        pink_path = find_any_pink_clip_path(timeline)
+        if pink_path:
+            aep_hint = find_aep_for_output(pink_path)
 
     if not afterfx_exe:
         print("Error: Could not find AfterFX.exe under C:\\Program Files\\Adobe.")
-    elif not afterfx_running():
-        print("Error: After Effects is not running. Open your AE project first.")
-    elif linked_comp:
-        print(f"FxLink clip under playhead -> opening comp '{linked_comp}' in After Effects...")
-        result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
-        if result == "OK":
-            print("Comp opened in After Effects.")
-        elif result == "NOT_FOUND":
-            print(f"Comp '{linked_comp}' was not found in the open AE project. Is the right project open?")
-        elif result is None:
-            print("Error: After Effects did not respond. Is it busy with a modal dialog?")
-        else:
-            print(f"Error from AE: {result}")
+    elif linked_path:
+        # Connect flow: the Pink clip's path maps to the AE project — launch
+        # AE with it or switch the running AE to it as needed.
+        linked_comp = os.path.splitext(os.path.basename(linked_path))[0]
+        aep_path = find_aep_for_output(linked_path)
+        if not aep_path:
+            print(f"Error: No .aep project found in '{os.path.dirname(os.path.dirname(linked_path))}'.")
+        elif ensure_ae_project(afterfx_exe, aep_path):
+            print(f"Opening comp '{linked_comp}' in After Effects...")
+            result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
+            if result == "OK":
+                print("Comp opened in After Effects.")
+            elif result == "NOT_FOUND":
+                print(f"Comp '{linked_comp}' was not found in project '{os.path.basename(aep_path)}'.")
+            elif result is None:
+                print("Error: After Effects did not respond. Is it busy with a modal dialog?")
+            else:
+                print(f"Error from AE: {result}")
+    elif not ae_running and not aep_hint:
+        print("Error: After Effects is not running, and no FxLink clip on this timeline maps to a project.")
+        print("Open your AE project first (or place the playhead over an existing FxLink clip).")
     else:
+        if not ae_running:
+            # Launch AE with the mapped project now so it boots while Resolve
+            # renders; the post-render project query retries until it's up.
+            print(f"Launching After Effects with {os.path.basename(aep_hint)} — it will load during the render...")
+            subprocess.Popen([afterfx_exe, aep_hint])
+
         presets_dict = project.GetRenderPresets()
         preset_names = [presets_dict[k] for k in sorted(presets_dict.keys())]
 
@@ -327,6 +416,13 @@ else:
                         else:
                             print("Render complete. Asking After Effects for the open project path...")
                             aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
+
+                            # AE may still be starting up if we just launched it — retry
+                            retry_deadline = time.time() + 90
+                            while aep_path is None and time.time() < retry_deadline:
+                                print("Waiting for After Effects to finish starting up...")
+                                time.sleep(5)
+                                aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX, timeout=10)
 
                             if aep_path is None:
                                 print("Error: After Effects did not respond. Is it busy with a modal dialog?")
