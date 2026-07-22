@@ -1,6 +1,7 @@
 import time
 import json
 import os
+import re
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
@@ -85,12 +86,17 @@ else:
 
     # Start the folder picker at <Project Media folder>\PreviewCache (created
     # if missing), based on the project setting. Falls back to a plain picker
-    # if no project media location is configured.
+    # if the project media location is unset, missing on this machine, or
+    # not writable.
     default_dir = None
     media_location = project.GetSetting("projectMediaLocation")
     if media_location:
         default_dir = os.path.join(media_location, "PreviewCache")
-        os.makedirs(default_dir, exist_ok=True)
+        try:
+            os.makedirs(default_dir, exist_ok=True)
+        except OSError as e:
+            print(f"Note: could not create '{default_dir}' ({e}) — using plain folder picker.")
+            default_dir = None
 
     print("Please select the render output folder...")
     target_dir = fusion.RequestDir(default_dir + os.sep) if default_dir else fusion.RequestDir()
@@ -119,10 +125,20 @@ else:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 custom_name = f"{project_name}_PreviewCache_{timestamp}"
 
+                # Image-sequence presets write one file per frame — render those
+                # into their own subfolder instead of littering the root folder.
+                fmt_codec = project.GetCurrentRenderFormatAndCodec() or {}
+                render_format = str(fmt_codec.get("format", "")).lower()
+                is_sequence = render_format in ("png", "exr", "dpx", "tif", "tiff", "jpg", "jpeg", "bmp")
+
+                render_dir = os.path.join(target_dir, custom_name) if is_sequence else target_dir
+                if is_sequence:
+                    os.makedirs(render_dir, exist_ok=True)
+
                 # SelectAllFrames: False tells Resolve to use the In/Out range set on the timeline
                 project.SetRenderSettings({
                     "SelectAllFrames": False,
-                    "TargetDir": target_dir,
+                    "TargetDir": render_dir,
                     "ExportAudio": False,
                     "CustomName": custom_name,
                 })
@@ -132,6 +148,12 @@ else:
                 if not job_id:
                     print("Error: Failed to add render job. Make sure an In/Out range is set on the timeline.")
                 else:
+                    # MarkIn is in the same frame coordinate space as GetStart()/
+                    # GetEnd() on timeline items — the reliable recordFrame source.
+                    all_jobs = project.GetRenderJobList() or []
+                    job_details = next((j for j in all_jobs if j.get("JobId") == job_id), {})
+                    mark_in = job_details.get("MarkIn")
+
                     print(f"Render job added: {custom_name} -> {target_dir}")
                     print("Starting render...")
 
@@ -163,18 +185,39 @@ else:
 
                         media_pool.SetCurrentFolder(preview_bin)
 
-                        # Find the rendered file by name regardless of extension
+                        imported = None
                         render_path = None
-                        for f in os.listdir(target_dir):
-                            if os.path.splitext(f)[0] == custom_name:
-                                render_path = os.path.join(target_dir, f)
-                                break
 
-                        if not render_path:
-                            print(f"Error: Could not find rendered file '{custom_name}' in '{target_dir}'.")
-                            imported = None
+                        if is_sequence:
+                            # Collect the frame-numbered files and import as one sequence
+                            frame_re = re.compile(r"^(.*?)(\d+)\.([A-Za-z0-9]+)$")
+                            frames = []
+                            for f in os.listdir(render_dir):
+                                m = frame_re.match(f)
+                                if m and f.startswith(custom_name):
+                                    frames.append((int(m.group(2)), m.group(1), len(m.group(2)), m.group(3)))
+                            if not frames:
+                                print(f"Error: No rendered frames found in '{render_dir}'.")
+                            else:
+                                frames.sort()
+                                start_idx, prefix, pad, ext = frames[0]
+                                end_idx = frames[-1][0]
+                                render_path = os.path.join(render_dir, f"{prefix}%0{pad}d.{ext}")
+                                imported = media_pool.ImportMedia([{
+                                    "FilePath": render_path,
+                                    "StartIndex": start_idx,
+                                    "EndIndex": end_idx,
+                                }])
                         else:
-                            imported = media_pool.ImportMedia([render_path])
+                            # Find the rendered file by name regardless of extension
+                            for f in os.listdir(render_dir):
+                                if os.path.splitext(f)[0] == custom_name:
+                                    render_path = os.path.join(render_dir, f)
+                                    break
+                            if not render_path:
+                                print(f"Error: Could not find rendered file '{custom_name}' in '{render_dir}'.")
+                            else:
+                                imported = media_pool.ImportMedia([render_path])
 
                         if not imported:
                             print(f"Warning: Could not import '{render_path}' into media pool.")
@@ -183,11 +226,22 @@ else:
 
                             clip = imported[0]
                             fps = timeline.GetSetting("timelineFrameRate") or 24
-                            clip_total_frames = int(clip.GetClipProperty("Frames"))
 
-                            # The clip's Start TC matches the timeline in-point since that's where rendering began
-                            start_tc_str = clip.GetClipProperty("Start TC")
-                            record_frame = tc_str_to_frame(start_tc_str, fps)
+                            # Image sequences import at Resolve's default sequence
+                            # rate (usually 24) — force the timeline's frame rate.
+                            if is_sequence and not clip.SetClipProperty("FPS", str(fps)):
+                                print(f"Warning: could not set clip FPS to {fps}.")
+
+                            clip_total_frames = int(clip.GetClipProperty("Frames"))
+                            # Sequence clips index from their file numbers, not 0
+                            clip_start_frame = int(float(clip.GetClipProperty("Start") or 0))
+
+                            if mark_in is not None:
+                                record_frame = mark_in
+                            else:
+                                # Fallback: the clip's Start TC matches the timeline in-point
+                                start_tc_str = clip.GetClipProperty("Start TC")
+                                record_frame = tc_str_to_frame(start_tc_str, fps)
 
                             # Find the highest track with any clip overlapping the range
                             clip_end = record_frame + clip_total_frames
@@ -205,8 +259,8 @@ else:
 
                             clip_info = {
                                 "mediaPoolItem": clip,
-                                "startFrame": 0,
-                                "endFrame": clip_total_frames,
+                                "startFrame": clip_start_frame,
+                                "endFrame": clip_start_frame + clip_total_frames,
                                 "mediaType": 1,
                                 "trackIndex": top_track,
                                 "recordFrame": record_frame,

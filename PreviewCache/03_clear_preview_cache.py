@@ -1,4 +1,34 @@
 import os
+import re
+
+
+def expand_media_paths(file_path):
+    """A media pool item's 'File Path' for an image sequence uses bracket
+    notation like 'name_[0100-0200].png' — expand it to the real per-frame
+    files. Single-file paths are returned as-is."""
+    m = re.match(r"^(.*)\[(\d+)-(\d+)\](\.[A-Za-z0-9]+)$", file_path)
+    if not m:
+        return [file_path]
+    prefix, start, end, ext = m.groups()
+    pad = len(start)
+    return [f"{prefix}{str(i).zfill(pad)}{ext}" for i in range(int(start), int(end) + 1)]
+
+
+def delete_media_files(file_path):
+    """Delete the file(s) behind a media pool 'File Path'; returns the number
+    deleted. Removes the containing folder too if it ends up empty."""
+    deleted = 0
+    for path in expand_media_paths(file_path):
+        if os.path.exists(path):
+            os.remove(path)
+            deleted += 1
+    parent = os.path.dirname(file_path)
+    try:
+        os.rmdir(parent)  # only succeeds if empty
+    except OSError:
+        pass
+    return deleted
+
 
 resolve = bmd.scriptapp("Resolve")
 
@@ -71,12 +101,12 @@ else:
 
             deleted_files = 0
             for path in file_paths:
-                if os.path.exists(path):
-                    os.remove(path)
-                    deleted_files += 1
-                    print(f"Deleted: {path}")
+                deleted = delete_media_files(path)
+                if deleted:
+                    deleted_files += deleted
+                    print(f"Deleted {deleted} file(s): {path}")
                 else:
-                    print(f"File not found (already deleted?): {path}")
+                    print(f"File(s) not found (already deleted?): {path}")
 
             print(f"Deleted {deleted_files} source file(s) from disk.")
 

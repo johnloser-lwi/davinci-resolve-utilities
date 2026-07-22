@@ -1,6 +1,35 @@
 import os
+import re
 
 CACHE_COLORS = ("Green", "Chocolate")
+
+
+def expand_media_paths(file_path):
+    """A media pool item's 'File Path' for an image sequence uses bracket
+    notation like 'name_[0100-0200].png' — expand it to the real per-frame
+    files. Single-file paths are returned as-is."""
+    m = re.match(r"^(.*)\[(\d+)-(\d+)\](\.[A-Za-z0-9]+)$", file_path)
+    if not m:
+        return [file_path]
+    prefix, start, end, ext = m.groups()
+    pad = len(start)
+    return [f"{prefix}{str(i).zfill(pad)}{ext}" for i in range(int(start), int(end) + 1)]
+
+
+def delete_media_files(file_path):
+    """Delete the file(s) behind a media pool 'File Path'; returns the number
+    deleted. Removes the containing folder too if it ends up empty."""
+    deleted = 0
+    for path in expand_media_paths(file_path):
+        if os.path.exists(path):
+            os.remove(path)
+            deleted += 1
+    parent = os.path.dirname(file_path)
+    try:
+        os.rmdir(parent)  # only succeeds if empty
+    except OSError:
+        pass
+    return deleted
 
 resolve = bmd.scriptapp("Resolve")
 
@@ -54,10 +83,11 @@ else:
             media_pool.DeleteClips([source_item])
             print("Removed clip from media pool.")
 
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"Deleted source file: {file_path}")
-        elif file_path:
-            print(f"Source file not found (already deleted?): {file_path}")
+        if file_path:
+            deleted = delete_media_files(file_path)
+            if deleted:
+                print(f"Deleted {deleted} source file(s): {file_path}")
+            else:
+                print(f"Source file(s) not found (already deleted?): {file_path}")
 
         print("Done.")
