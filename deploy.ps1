@@ -4,6 +4,14 @@ $dest   = "C:\Users\john-\AppData\Roaming\Blackmagic Design\DaVinci Resolve\Supp
 if (-not (Test-Path $dest)) {
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
     Write-Host "Created destination folder: $dest"
+} else {
+    # Mirror the repo: remove previously deployed .py files so renamed/removed
+    # scripts don't linger as orphans (duplicate menu entries) in Resolve.
+    $removed = Get-ChildItem -Path $dest -Recurse -Filter "*.py" -ErrorAction SilentlyContinue
+    foreach ($old in $removed) { Remove-Item $old.FullName -Force }
+    if ($removed.Count -gt 0) {
+        Write-Host "Cleared $($removed.Count) previously deployed .py file(s)."
+    }
 }
 
 $scripts = Get-ChildItem -Path $source -Recurse -Filter "*.py"
