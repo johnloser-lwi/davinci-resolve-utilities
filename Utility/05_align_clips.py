@@ -145,19 +145,74 @@ def current_timeline():
         return None
 
 
+def track_type_of(item):
+    """'video', 'audio', 'subtitle', or None when it can't be determined."""
+    try:
+        info = item.GetTrackTypeAndIndex()
+    except Exception:
+        return None
+    if isinstance(info, dict):          # 1-indexed table on some versions
+        info = [info.get(1), info.get(2)]
+    if isinstance(info, (list, tuple)) and info:
+        return str(info[0]).lower()
+    return None
+
+
+def item_uid(item):
+    try:
+        uid = item.GetUniqueId()
+        if uid:
+            return str(uid)
+    except Exception:
+        pass
+    try:
+        return f"{item.GetName()}@{item.GetStart()}"
+    except Exception:
+        return str(id(item))
+
+
+SELECTION_PASSES = 3
+
+
 def selected_clips():
+    """Selected timeline items on VIDEO tracks only.
+
+    GetSelectedClips() is unreliable: it intermittently returns only PART of
+    the selection (measured returning 1 of 3 selected clips, depending on what
+    API calls preceded it). A missed clip doesn't just fail to move — it is
+    also left out of the min/max the alignment target is built from, which
+    throws every other clip off too. So poll it several times and union the
+    results by unique id.
+
+    Linked audio items are filtered out as well; they have no usable Pan/Tilt.
+    Returns (video_items, skipped_non_video).
+    """
     timeline = current_timeline()
     if not timeline:
-        return []
-    try:
-        sel = timeline.GetSelectedClips()
-    except Exception as e:
-        print(f"GetSelectedClips failed — is this Resolve version new enough? ({e})")
-        return []
-    if not sel:
-        return []
-    # Comes back as a list or a 1-indexed dict depending on version
-    return list(sel.values()) if isinstance(sel, dict) else list(sel)
+        return [], 0
+
+    found = {}
+    for _ in range(SELECTION_PASSES):
+        try:
+            sel = timeline.GetSelectedClips()
+        except Exception as e:
+            print(f"GetSelectedClips failed — is this Resolve version new enough? ({e})")
+            return [], 0
+        if not sel:
+            continue
+        # Comes back as a list or a 1-indexed dict depending on version
+        items = list(sel.values()) if isinstance(sel, dict) else list(sel)
+        for item in items:
+            found.setdefault(item_uid(item), item)
+
+    video, skipped = [], 0
+    for item in found.values():
+        kind = track_type_of(item)
+        if kind is not None and kind != "video":
+            skipped += 1
+            continue
+        video.append(item)
+    return video, skipped
 
 
 def timeline_resolution(project):
@@ -194,10 +249,16 @@ def clip_rect(item, project, tl_w, tl_h, behavior):
     (0, 0) is the frame centre. Rotation is deliberately ignored — the
     unrotated box is used for alignment.
     """
-    try:
-        props = item.GetProperty() or {}
-    except Exception:
-        props = {}
+    # Retry the read — an empty or partial dict here would silently corrupt the
+    # computed width and send the clip to the wrong place.
+    props = {}
+    for _ in range(3):
+        try:
+            props = item.GetProperty() or {}
+        except Exception:
+            props = {}
+        if "Pan" in props or "ZoomX" in props:
+            break
 
     def num(key, default=0.0):
         try:
@@ -309,6 +370,69 @@ def set_raw(rect, key, value):
     return set_verified(rect, key, value)
 
 
+def tc_to_frame(tc_str, fps):
+    drop_frame = ";" in tc_str
+    h, m, s, f = map(int, tc_str.replace(";", ":").split(":"))
+    fps_round = round(float(fps))
+    total = (h * 3600 + m * 60 + s) * fps_round + f
+    if drop_frame:
+        drop = 4 if fps_round == 60 else 2
+        total_minutes = 60 * h + m
+        total -= drop * (total_minutes - total_minutes // 10)
+    return total
+
+
+def frame_to_tc(frame, fps, drop_frame):
+    fps_round = round(float(fps))
+    sep = ":"
+    if drop_frame:
+        drop = 4 if fps_round == 60 else 2
+        frames_per_min = fps_round * 60 - drop
+        frames_per_10min = fps_round * 600 - drop * 9
+        d, m = divmod(frame, frames_per_10min)
+        frame += drop * 9 * d
+        if m >= drop:
+            frame += drop * ((m - drop) // frames_per_min)
+        sep = ";"
+    f = frame % fps_round
+    s = (frame // fps_round) % 60
+    mnt = (frame // (fps_round * 60)) % 60
+    h = (frame // (fps_round * 3600)) % 24
+    return f"{h:02d}:{mnt:02d}:{s:02d}{sep}{f:02d}"
+
+
+def refresh_viewer(timeline):
+    """Force Resolve to re-render after transform changes.
+
+    Resolve caches the composited frame and doesn't always redraw when a
+    clip's Pan/Tilt is changed via the API — the values are correct but the
+    viewer still shows the old position, which looks like the clip was
+    skipped. Stepping the playhead one frame and back invalidates that cache.
+    """
+    try:
+        original = timeline.GetCurrentTimecode()
+    except Exception:
+        return False
+    if not original:
+        return False
+    try:
+        fps = timeline.GetSetting("timelineFrameRate") or 24
+        drop = str(timeline.GetSetting("timelineDropFrameTimecode") or "0") == "1"
+        frame = tc_to_frame(original, fps)
+    except Exception:
+        return False
+
+    for delta in (1, -1):   # -1 covers sitting on the very last frame
+        try:
+            probe = frame_to_tc(frame + delta, fps, drop)
+            if timeline.SetCurrentTimecode(probe):
+                timeline.SetCurrentTimecode(original)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # --------------------------------------------------------------------------
 # panel
 # --------------------------------------------------------------------------
@@ -320,7 +444,7 @@ class AlignPanel:
 
         root.title("Align Clips")
         root.configure(bg=BG)
-        root.minsize(S(430), S(430))
+        root.minsize(S(430), S(260))
         geo = self.prefs.get("geometry")
         if geo and abs(float(self.prefs.get("geometry_scale", 1.0)) - SCALE) < 0.01:
             try:
@@ -357,7 +481,39 @@ class AlignPanel:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
     def _build(self):
-        head = tk.Frame(self.root, bg=BG)
+        # Status bar is pinned outside the scroll area so it's always visible
+        bottom = tk.Frame(self.root, bg=PANEL2)
+        bottom.pack(fill="x", side="bottom")
+
+        # Scrollable body, so shrinking the window doesn't clip the controls
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        content = tk.Frame(self.canvas, bg=BG)
+        window = self.canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def sync_scroll(_event=None):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            needed = content.winfo_reqheight() > self.canvas.winfo_height()
+            if needed and not self.vsb.winfo_ismapped():
+                self.vsb.pack(side="right", fill="y")
+            elif not needed and self.vsb.winfo_ismapped():
+                self.vsb.pack_forget()
+
+        def fit_width(event):
+            self.canvas.itemconfigure(window, width=event.width)
+            sync_scroll()
+
+        content.bind("<Configure>", sync_scroll)
+        self.canvas.bind("<Configure>", fit_width)
+        self.root.bind_all(
+            "<MouseWheel>",
+            lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        head = tk.Frame(content, bg=BG)
         head.pack(fill="x", padx=S(14), pady=(S(12), S(4)))
         self.tl_label = tk.Label(head, text="—", bg=BG, fg=FG, anchor="w",
                                  font=FONT(11, "bold"))
@@ -375,26 +531,17 @@ class AlignPanel:
         self.top_btn.pack(side="right", padx=(0, S(6)))
         self._paint_topmost()
 
-        # mode toggle
-        mode_frame = tk.Frame(self.root, bg=BG)
-        mode_frame.pack(fill="x", padx=S(14), pady=(S(12), S(4)))
-        tk.Label(mode_frame, text="Align by", bg=BG, fg=SUB,
-                 font=FONT(9)).pack(side="left", padx=(0, S(8)))
-        self.mode = tk.StringVar(value=self.prefs.get("mode", "Edges"))
-        self.mode_buttons = {}
-        for label in ("Edges", "Centres"):
-            b = tk.Button(mode_frame, text=label, relief="flat", bd=0,
-                          font=FONT(9), cursor="hand2", padx=S(14), pady=S(5),
-                          highlightthickness=0,
-                          command=lambda l=label: self.set_mode(l))
-            b.pack(side="left", padx=(0, S(4)))
-            self.mode_buttons[label] = b
-        tk.Label(mode_frame,
-                 text="edges use each clip's real size", bg=BG, fg=SUB,
-                 font=FONT(8)).pack(side="left", padx=(S(10), 0))
-        self._paint_mode()
+        # toggles
+        toggles = tk.Frame(content, bg=BG)
+        toggles.pack(fill="x", padx=S(14), pady=(S(12), S(2)))
 
-        grid = tk.Frame(self.root, bg=BG)
+        self.mode = tk.StringVar(value=self.prefs.get("mode", "Edges"))
+        self.mode_buttons = self._toggle_row(
+            toggles, "Align by", ("Edges", "Centres"), self.set_mode,
+            "edges use each clip's real size")
+        self._paint_toggles()
+
+        grid = tk.Frame(content, bg=BG)
         grid.pack(fill="x", padx=S(14), pady=(S(10), 0))
         tk.Label(grid, text="HORIZONTAL", bg=BG, fg=SUB,
                  font=FONT(8, "bold"), anchor="w").grid(row=0, column=0,
@@ -424,7 +571,7 @@ class AlignPanel:
             grid.columnconfigure(col, weight=1)
 
         # --- move everything together -----------------------------------
-        move = tk.Frame(self.root, bg=BG)
+        move = tk.Frame(content, bg=BG)
         move.pack(fill="x", padx=S(14), pady=(S(14), 0))
         tk.Label(move, text="MOVE TOGETHER", bg=BG, fg=SUB,
                  font=FONT(8, "bold"), anchor="w").pack(fill="x", pady=(0, S(4)))
@@ -464,10 +611,8 @@ class AlignPanel:
                     primary=True).pack(side="left", padx=(S(10), 0))
         make_button(set_row, "Read", self.read_position).pack(side="left", padx=(S(4), 0))
         tk.Label(move, text="Blank = leave that axis alone. Values match the Inspector.",
-                 bg=BG, fg=SUB, font=FONT(8), anchor="w").pack(fill="x", pady=(S(4), 0))
+                 bg=BG, fg=SUB, font=FONT(8), anchor="w").pack(fill="x", pady=(S(4), S(14)))
 
-        bottom = tk.Frame(self.root, bg=PANEL2)
-        bottom.pack(fill="x", side="bottom")
         self.status = tk.Label(bottom, text="", bg=PANEL2, fg=SUB, anchor="w",
                                font=FONT(8), padx=S(12), pady=S(5))
         self.status.pack(side="left", fill="x", expand=True)
@@ -479,7 +624,25 @@ class AlignPanel:
         box.pack(side="left", padx=(0, S(10)), pady=S(3))
         box.bind("<<ComboboxSelected>>", self.on_scale_change)
 
-    def _paint_mode(self):
+    def _toggle_row(self, parent, label, options, on_click, hint=None):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(0, S(5)))
+        tk.Label(row, text=label, bg=BG, fg=SUB, font=FONT(9), width=8,
+                 anchor="w").pack(side="left", padx=(0, S(6)))
+        buttons = {}
+        for opt in options:
+            b = tk.Button(row, text=opt, relief="flat", bd=0, font=FONT(9),
+                          cursor="hand2", padx=S(12), pady=S(5),
+                          highlightthickness=0,
+                          command=lambda o=opt: on_click(o))
+            b.pack(side="left", padx=(0, S(4)))
+            buttons[opt] = b
+        if hint:
+            tk.Label(row, text=hint, bg=BG, fg=SUB,
+                     font=FONT(8)).pack(side="left", padx=(S(8), 0))
+        return buttons
+
+    def _paint_toggles(self):
         for label, btn in self.mode_buttons.items():
             active = (label == self.mode.get())
             btn.config(bg=ACCENT if active else BTN,
@@ -490,7 +653,7 @@ class AlignPanel:
         self.mode.set(label)
         self.prefs["mode"] = label
         save_prefs(self.prefs)
-        self._paint_mode()
+        self._paint_toggles()
         self.say(f"Aligning by {label.lower()}.")
 
     def _paint_topmost(self):
@@ -538,9 +701,11 @@ class AlignPanel:
                 ok &= good
                 retries += tries - 1
             changed += 1 if ok else 0
+        redrawn = refresh_viewer(current_timeline())
         self.say(f"Moved {changed} of {len(rects)} clip(s) by "
                  f"{dx * step:+.0f}, {dy * step:+.0f}."
-                 + (f"  ({retries} retry needed)" if retries else ""))
+                 + (f"  ({retries} retry needed)" if retries else "")
+                 + ("" if redrawn else "  [viewer refresh failed]"))
 
     def set_absolute(self):
         """Set Pan and/or Tilt outright on every selected clip."""
@@ -574,8 +739,10 @@ class AlignPanel:
                 ok &= good
                 retries += tries - 1
             changed += 1 if ok else 0
+        redrawn = refresh_viewer(current_timeline())
         self.say(f"Set position on {changed} of {len(rects)} clip(s)."
-                 + (f"  ({retries} retry needed)" if retries else ""))
+                 + (f"  ({retries} retry needed)" if retries else "")
+                 + ("" if redrawn else "  [viewer refresh failed]"))
 
     def read_position(self):
         """Fill the X/Y fields from the first selected clip."""
@@ -590,7 +757,7 @@ class AlignPanel:
     def rebuild(self):
         for child in self.root.winfo_children():
             child.destroy()
-        self.root.minsize(S(430), S(430))
+        self.root.minsize(S(430), S(260))
         self._style()
         self._build()
         self.refresh()
@@ -623,9 +790,15 @@ class AlignPanel:
             self.say("Open a timeline to begin.", True)
             return
         self.tl_label.config(text=timeline.GetName())
-        count = len(selected_clips())
-        self.sel_label.config(text=f"{count} clip(s) selected")
-        self.say("Ready." if count else "Select clips on the timeline.")
+        clips, skipped = selected_clips()
+        self._set_count(len(clips), skipped)
+        self.say("Ready." if clips else "Select clips on the timeline.")
+
+    def _set_count(self, count, skipped):
+        text = f"{count} video clip(s) selected"
+        if skipped:
+            text += f"   ·   ignoring {skipped} audio/other"
+        self.sel_label.config(text=text)
 
     def gather(self, minimum):
         """Read the live selection and build rectangles for each clip."""
@@ -634,21 +807,22 @@ class AlignPanel:
         if not project or not timeline:
             self.say("No timeline open.", True)
             return None
-        clips = selected_clips()
-        self.sel_label.config(text=f"{len(clips)} clip(s) selected")
+        clips, skipped = selected_clips()
+        self._set_count(len(clips), skipped)
         if len(clips) < minimum:
-            self.say(f"Select at least {minimum} clips (found {len(clips)}).", True)
+            self.say(f"Select at least {minimum} video clip(s) (found {len(clips)}).", True)
             return None
         tl_w, tl_h = timeline_resolution(project)
+        self.tl_w, self.tl_h = tl_w, tl_h
         behavior = project.GetSetting("timelineInputResMismatchBehavior")
         return [clip_rect(c, project, tl_w, tl_h, behavior) for c in clips]
 
     def align(self, how):
+        edges = self.mode.get() == "Edges"
         rects = self.gather(2)
         if not rects:
             return
-        edges = self.mode.get() == "Edges"
-        print(f"\nAlign {how} ({'edges' if edges else 'centres'}):")
+        print(f"\nAlign {how} ({'edges' if edges else 'centres'}, to selection):")
         for r in rects:
             print(f"  before  {r['name']}: Pan={r['pan']:.1f} Tilt={r['tilt']:.1f} "
                   f"size={r['w']:.0f}x{r['h']:.0f}")
@@ -659,52 +833,47 @@ class AlignPanel:
             ok, tries = fn(rect, value)
             return (1 if ok else 0), (tries - 1)
 
+        # Axis-specific accessors so both directions share one code path.
         if how in ("left", "right", "centreh"):
-            if how == "centreh":
-                for r in rects:
-                    c, t = do(apply_pan, r, 0.0)
-                    changed += c
-                    retries += t
-            elif edges:
-                target = min(r["left"] for r in rects) if how == "left" \
-                    else max(r["right"] for r in rects)
-                for r in rects:
-                    new_cx = target + r["w"] / 2.0 if how == "left" else target - r["w"] / 2.0
-                    c, t = do(apply_pan, r, new_cx)
-                    changed += c
-                    retries += t
-            else:
-                target = min(r["cx"] for r in rects) if how == "left" \
-                    else max(r["cx"] for r in rects)
-                for r in rects:
-                    c, t = do(apply_pan, r, target)
-                    changed += c
-                    retries += t
+            size = lambda r: r["w"]
+            near = lambda r: r["left"]          # more negative side
+            far = lambda r: r["right"]
+            centre = lambda r: r["cx"]
+            mover = apply_pan
+            low_side = (how == "left")
+            is_centre = (how == "centreh")
         else:
-            if how == "middle":
-                for r in rects:
-                    c, t = do(apply_tilt, r, 0.0)
-                    changed += c
-                    retries += t
-            elif edges:
-                # +Y is up, so "top" is the largest top edge
-                target = max(r["top"] for r in rects) if how == "top" \
-                    else min(r["bottom"] for r in rects)
-                for r in rects:
-                    new_cy = target - r["h"] / 2.0 if how == "top" else target + r["h"] / 2.0
-                    c, t = do(apply_tilt, r, new_cy)
-                    changed += c
-                    retries += t
-            else:
-                target = max(r["cy"] for r in rects) if how == "top" \
-                    else min(r["cy"] for r in rects)
-                for r in rects:
-                    c, t = do(apply_tilt, r, target)
-                    changed += c
-                    retries += t
+            size = lambda r: r["h"]
+            near = lambda r: r["bottom"]        # +Y is up, so bottom is -ve
+            far = lambda r: r["top"]
+            centre = lambda r: r["cy"]
+            mover = apply_tilt
+            low_side = (how == "bottom")
+            is_centre = (how == "middle")
 
+        if is_centre:
+            # Centre of the selection's own bounds, not the frame's
+            if edges:
+                mid = (min(near(r) for r in rects) + max(far(r) for r in rects)) / 2.0
+            else:
+                mid = (min(centre(r) for r in rects) + max(centre(r) for r in rects)) / 2.0
+            target_for = lambda r: mid
+        elif edges:
+            edge = min(near(r) for r in rects) if low_side else max(far(r) for r in rects)
+            target_for = (lambda r: edge + size(r) / 2.0) if low_side                 else (lambda r: edge - size(r) / 2.0)
+        else:
+            pos = min(centre(r) for r in rects) if low_side else max(centre(r) for r in rects)
+            target_for = lambda r: pos
+
+        for r in rects:
+            c, t = do(mover, r, target_for(r))
+            changed += c
+            retries += t
+
+        redrawn = refresh_viewer(current_timeline())
         self.say(f"Aligned {changed} of {len(rects)} clip(s) — {how}."
-                 + (f"  ({retries} retry needed)" if retries else ""))
+                 + (f"  ({retries} retry needed)" if retries else "")
+                 + ("" if redrawn else "  [viewer refresh failed]"))
 
     def distribute(self, axis):
         rects = self.gather(3)
@@ -712,23 +881,25 @@ class AlignPanel:
             return
         key = "cx" if axis == "h" else "cy"
         ordered = sorted(rects, key=lambda r: r[key])
-        first, last = ordered[0], ordered[-1]
-        span = last[key] - first[key]
-        step = span / float(len(ordered) - 1)
+        mover = apply_pan if axis == "h" else apply_tilt
 
         print(f"\nDistribute {'horizontally' if axis == 'h' else 'vertically'}:")
         for r in ordered:
             print(f"  before  {r['name']}: Pan={r['pan']:.1f} Tilt={r['tilt']:.1f}")
 
+        # Outermost two stay put; everything between them is evenly spaced
         changed, retries = 0, 0
+        first = ordered[0]
+        step = (ordered[-1][key] - first[key]) / float(len(ordered) - 1)
         for i, r in enumerate(ordered[1:-1], start=1):
-            target = first[key] + step * i
-            ok, tries = apply_pan(r, target) if axis == "h" else apply_tilt(r, target)
+            ok, tries = mover(r, first[key] + step * i)
             changed += 1 if ok else 0
             retries += tries - 1
 
+        redrawn = refresh_viewer(current_timeline())
         self.say(f"Distributed {len(ordered)} clip(s) — moved {changed} inner clip(s)."
-                 + (f"  ({retries} retry needed)" if retries else ""))
+                 + (f"  ({retries} retry needed)" if retries else "")
+                 + ("" if redrawn else "  [viewer refresh failed]"))
 
     def _on_close(self):
         try:
