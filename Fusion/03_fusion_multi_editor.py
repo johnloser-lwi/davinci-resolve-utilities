@@ -283,29 +283,64 @@ def scan(clips):
     return groups, comps
 
 
+MAX_INPUTS = 400        # hard cap on inputs examined per tool
+FALLBACK_PROBES = 20    # GetInput() calls allowed when metadata is inconclusive
+
+
 def parameters_of(tool):
-    """Editable numeric/point parameters, as (label, input_id, axis)."""
+    """Editable numeric/point parameters, as (label, input_id, axis).
+
+    Classification comes from each input's METADATA, not by reading its value.
+    Calling GetInput() on every input of a heavy OFX plugin is slow enough to
+    hang Resolve, and on some plugins it also fails outright — which made the
+    parameter list come back empty. GetAttrs() is cheap and doesn't evaluate
+    the parameter, so it is used first and value reads are strictly budgeted.
+
+    Display names repeat within a tool (several inputs can both be called
+    "Size"), so the unique input ID is shown alongside.
+    """
     params = []
+    probes_left = FALLBACK_PROBES
     try:
         inputs = tool.GetInputList() or {}
     except Exception:
         return params
-    for inp in inputs.values():
+
+    for inp in list(inputs.values())[:MAX_INPUTS]:
         try:
-            attrs = inp.GetAttrs()
-            input_id = attrs.get("INPS_ID")
-            name = attrs.get("INPS_Name") or input_id
-            if not input_id:
-                continue
-            value = tool.GetInput(input_id)
+            attrs = inp.GetAttrs() or {}
         except Exception:
             continue
-        kind = classify(value)
+        input_id = attrs.get("INPS_ID")
+        if not input_id:
+            continue
+        name = attrs.get("INPS_Name") or input_id
+        dtype = str(attrs.get("INPS_DataType") or "")
+        control = str(attrs.get("INPID_InputControl") or "")
+
+        if dtype == "Point" or control == "PointControl":
+            kind = "point"
+        elif dtype == "Number":
+            kind = "number"
+        elif dtype:
+            kind = None          # Text, Image, Mask, Gradient, FontStyle...
+        elif probes_left > 0:
+            # No usable metadata — fall back to reading the value, but only
+            # for a bounded number of inputs so this can never run away.
+            probes_left -= 1
+            try:
+                kind = classify(tool.GetInput(input_id))
+            except Exception:
+                kind = None
+        else:
+            kind = None
+
+        suffix = "" if str(name) == str(input_id) else f"   ·   {input_id}"
         if kind == "number":
-            params.append((str(name), input_id, None))
+            params.append((f"{name}{suffix}", input_id, None))
         elif kind == "point":
-            params.append((f"{name}.X", input_id, 0))
-            params.append((f"{name}.Y", input_id, 1))
+            params.append((f"{name}.X{suffix}", input_id, 0))
+            params.append((f"{name}.Y{suffix}", input_id, 1))
     return params
 
 
@@ -491,10 +526,24 @@ class MultiEditor:
         self.param_box.grid(row=1, column=1, sticky="ew")
         self.param_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_values())
 
-        tk.Label(pick, text="Order by", bg=BG, fg=SUB, font=FONT(9), width=9,
+        tk.Label(pick, text="Find", bg=BG, fg=SUB, font=FONT(9), width=9,
                  anchor="w").grid(row=2, column=0, sticky="w", pady=(S(4), 0))
+        find_row = tk.Frame(pick, bg=BG)
+        find_row.grid(row=2, column=1, sticky="ew", pady=(S(4), 0))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self.apply_param_filter())
+        tk.Entry(find_row, textvariable=self.filter_var, bg=PANEL, fg=FG,
+                 relief="flat", insertbackground=FG, font=FONT(9),
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=ACCENT).pack(side="left", fill="x", expand=True, ipady=S(3))
+        self.filter_count = tk.Label(find_row, text="", bg=BG, fg=SUB, font=FONT(8))
+        self.filter_count.pack(side="left", padx=(S(8), 0))
+        make_button(find_row, "Clear", lambda: self.filter_var.set("")).pack(side="left", padx=(S(6), 0))
+
+        tk.Label(pick, text="Order by", bg=BG, fg=SUB, font=FONT(9), width=9,
+                 anchor="w").grid(row=3, column=0, sticky="w", pady=(S(4), 0))
         order_row = tk.Frame(pick, bg=BG)
-        order_row.grid(row=2, column=1, sticky="ew", pady=(S(4), 0))
+        order_row.grid(row=3, column=1, sticky="ew", pady=(S(4), 0))
         self.order_var = tk.StringVar(value=self.prefs.get("order_by", "Value"))
         order_box = ttk.Combobox(order_row, textvariable=self.order_var,
                                  values=["Value", "Timeline position", "Node name"],
@@ -663,13 +712,28 @@ class MultiEditor:
             save_prefs(self.prefs)
         self.params = parameters_of(self.entries[0]["tool"]) if self.entries else []
         labels = [p[0] for p in self.params]
-        self.param_box["values"] = labels
         if labels:
             remembered = self.prefs.get("last_param")
             self.param_var.set(remembered if remembered in labels else labels[0])
         else:
             self.param_var.set("")
+        self.apply_param_filter()
         self.refresh_values()
+
+    def apply_param_filter(self):
+        """Narrow the parameter dropdown. Matches name, input id and axis, so
+        typing 'center' or 'blur' cuts a long list down fast."""
+        query = self.filter_var.get().strip().lower() if hasattr(self, "filter_var") else ""
+        labels = [p[0] for p in self.params]
+        shown = [l for l in labels if query in l.lower()] if query else labels
+        self.param_box["values"] = shown
+        total = len(labels)
+        if not total:
+            self.filter_count.config(text="")
+        elif query:
+            self.filter_count.config(text=f"{len(shown)}/{total}")
+        else:
+            self.filter_count.config(text=f"{total}")
 
     def current_param(self):
         label = self.param_var.get()
