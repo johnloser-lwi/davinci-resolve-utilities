@@ -1,6 +1,24 @@
 $source = $PSScriptRoot
 $dest   = "C:\Users\john-\AppData\Roaming\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\John"
 
+# --- Back up the keyboard mapping before touching any scripts -------------
+# Resolve stores script shortcuts by FILE PATH (verified in keyboard.preset.xml:
+# fuHotkey_FlowView_RunScript{filename = 'Scripts:/Utility/...'}). Adding a
+# script is safe, but renaming or removing one orphans its shortcut. Keep a
+# rolling backup so a mapping can always be restored.
+$kbPreset = "$env:APPDATA\Blackmagic Design\DaVinci Resolve\Preferences\keyboard.preset.xml"
+if (Test-Path $kbPreset) {
+    $backupDir = Join-Path $source ".keyboard-backups"
+    if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    Copy-Item $kbPreset (Join-Path $backupDir "keyboard.preset.$stamp.xml") -Force
+    # keep the 10 most recent
+    Get-ChildItem $backupDir -Filter "keyboard.preset.*.xml" |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 10 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Host "Backed up keyboard mapping -> .keyboard-backups\keyboard.preset.$stamp.xml"
+}
+
 if (-not (Test-Path $dest)) {
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
     Write-Host "Created destination folder: $dest"
