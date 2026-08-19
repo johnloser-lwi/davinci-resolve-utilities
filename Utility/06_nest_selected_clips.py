@@ -815,16 +815,18 @@ class NestPanel:
             except Exception as e:
                 print("  media pool SetClipColor failed: " + str(e))
 
-        if placed:
-            print("  placed on V" + str(target) + " at frame " + str(min_start))
-            self.say(name + " placed on V" + str(target) + ". "
-                     + str(handled) + " original(s) " + action
-                     + ((" Coloured " + colour + ".") if colour else ""))
-        else:
-            self.say("Could not place " + name + " - drag it onto V"
-                     + str(target) + " from " + PRECOMPS_BIN + ".", True)
-
         self.pending = None
+
+        if placed:
+            print("  placed on V" + str(target) + " at frame " + str(min_start)
+                  + ". " + str(handled) + " original(s) " + action
+                  + ((", coloured " + colour) if colour else ""))
+            # Job done - close rather than leaving another panel lying around.
+            self._on_close()
+            return
+
+        self.say("Could not place " + name + " - drag it onto V"
+                 + str(target) + " from " + PRECOMPS_BIN + ".", True)
         self.step2_btn.config(state="disabled")
         self.rescan()
 
