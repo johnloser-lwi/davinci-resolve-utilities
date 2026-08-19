@@ -1,27 +1,30 @@
 import ctypes
 import json
 import os
+import time
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk
 
-# Nest Selected Clips — build a nested timeline from the selected clips,
-# non-destructively.
+# Nest Selected Clips - two-step, so a huge source timeline costs nothing.
 #
 # Unlike a compound clip, a nested timeline is a real project timeline, so the
 # scripting API can see inside it: GetSelectedClips, transforms and the align
 # tools all work within it. Compound clips are a black box to scripting.
 #
-# How it works, and why:
-#   1. The source timeline is DUPLICATED. A duplicate keeps every clip's
-#      transform, grade and Fusion comp — rebuilding from media pool items
-#      would throw all of that away.
-#   2. Everything except the selected clips is removed from the duplicate.
-#   3. The originals are DISABLED, never deleted, so nothing is lost.
-#   4. The nest is placed on a new track above, covering the same span.
+# The flow:
+#   Step 1  copy the clips in Resolve (Ctrl+C), then click "Create nest
+#           timeline". An empty timeline is made with the source timeline's
+#           settings copied across, filed into the PreComps bin, and opened
+#           with the playhead on the first frame.
+#   Paste   you paste (Ctrl+V). Resolve's own paste carries everything -
+#           grades, Fusion comps, Text+ generators - which no API rebuild can.
+#   Step 2  click "Pasted, place it". The nest is measured, the originals are
+#           disabled or deleted, and it is placed back over the same span
+#           without breaking layer order.
 #
-# The duplicate also inherits the source timeline's resolution and frame rate,
-# which avoids the usual nested-timeline pitfall of unwanted rescaling.
+# Nothing duplicates the source timeline, so this stays fast no matter how
+# long the edit gets.
 
 for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
                         ("shcore", "SetProcessDpiAwareness", 1),
@@ -229,6 +232,44 @@ def selected_clips(include_audio=False):
         records.append(record)
     records.sort(key=lambda r: r["start"])
     return records
+
+
+def clone_timeline_settings(source, target):
+    """Copy every timeline setting across, custom ones included.
+
+    GetSetting() with no argument returns the whole dict on builds that
+    support it, which matches settings exactly rather than guessing at a
+    hand-written list. Falls back to the essentials if that isn't available.
+    """
+    copied = 0
+    settings = None
+    try:
+        settings = source.GetSetting()
+    except Exception:
+        settings = None
+
+    if isinstance(settings, dict) and settings:
+        for key, value in settings.items():
+            try:
+                if target.SetSetting(key, str(value)):
+                    copied += 1
+            except Exception:
+                continue
+        return copied, len(settings)
+
+    essentials = ["timelineResolutionWidth", "timelineResolutionHeight",
+                  "timelineFrameRate", "timelinePlaybackFrameRate",
+                  "timelinePixelAspectRatio", "timelineDropFrameTimecode",
+                  "timelineOutputResolutionWidth", "timelineOutputResolutionHeight",
+                  "timelineInterlaceProcessing"]
+    for key in essentials:
+        try:
+            value = source.GetSetting(key)
+            if value not in (None, "") and target.SetSetting(key, str(value)):
+                copied += 1
+        except Exception:
+            continue
+    return copied, len(essentials)
 
 
 def track_is_free(timeline, track_index, start, end):
@@ -452,15 +493,17 @@ class NestPanel:
 
         actions = tk.Frame(content, bg=BG)
         actions.pack(fill="x", padx=S(14), pady=(S(12), 0))
-        make_button(actions, "Create Nested Timeline", self.do_nest,
+        make_button(actions, "1 - Create nest timeline", self.do_create,
                     primary=True).pack(side="left")
+        self.step2_btn = make_button(actions, "2 - Pasted, place it",
+                                     self.do_place)
+        self.step2_btn.pack(side="left", padx=(S(8), 0))
+        self.step2_btn.config(state="disabled")
 
         tk.Label(content,
-                 text="The nest is a duplicate of this timeline with everything "
-                      "but the selection removed, so transforms, grades and "
-                      "Fusion comps survive. It inherits the parent's resolution "
-                      "and frame rate. Originals are disabled, not deleted, "
-                      "and the nest is filed into the PreComps bin.",
+                 text="Copy the clips in Resolve first, then step 1. Paste into "
+                      "the new timeline at the first frame, then step 2. Resolve's "
+                      "own paste keeps grades, Fusion comps and Text+ intact.",
                  bg=BG, fg=SUB, font=FONT(8), anchor="w", justify="left",
                  wraplength=S(480)).pack(fill="x", padx=S(14), pady=(S(8), S(14)))
 
@@ -559,119 +602,113 @@ class NestPanel:
             self.say("Select clips on the timeline. Clips inside a compound clip "
                      "can't be read by the API.", True)
 
-    def do_nest(self):
+    # -- step 1: make the empty nest ------------------------------------
+    def do_create(self):
         project = current_project()
         source = current_timeline()
         if not project or not source:
             self.say("No timeline open.", True)
             return
-        include_audio = bool(self.audio_var.get())
-        # Reuse the records the table is already showing — what you see listed
-        # is exactly what gets nested, and it avoids re-querying every clip.
-        clips = self.clips or selected_clips(include_audio)
+        clips = self.clips or selected_clips(bool(self.audio_var.get()))
         if not clips:
             self.say("Nothing selected.", True)
             return
 
-        min_start = min(c["start"] for c in clips)
-        max_end = max(c["end"] for c in clips)
-        keep = set()
-        lowest_track = None
-        highest_track = 0
-        has_audio = False
+        lowest = highest = None
         for c in clips:
-            kind, idx = c["kind"], c["idx"]
-            keep.add((kind, idx, c["start"]))
-            if kind == "audio":
-                has_audio = True
-            else:
-                if idx:
-                    highest_track = max(highest_track, idx)
-                    if lowest_track is None or idx < lowest_track:
-                        lowest_track = idx
-        lowest_track = lowest_track or 1
-        highest_track = highest_track or lowest_track
+            if c["kind"] == "video" and c["idx"]:
+                lowest = c["idx"] if lowest is None else min(lowest, c["idx"])
+                highest = c["idx"] if highest is None else max(highest, c["idx"])
+        lowest = lowest or 1
+        highest = highest or lowest
 
-        # Colour of the earliest clip, applied to the nest afterwards
-        source_colour = ""
+        colour = ""
         if self.colour_var.get():
             try:
-                source_colour = clips[0]["item"].GetClipColor() or ""
+                colour = clips[0]["item"].GetClipColor() or ""
             except Exception:
-                source_colour = ""
+                colour = ""
 
         name = unique_timeline_name(project, self.name_var.get().strip() or "Nest")
+        t0 = time.time()
 
-        print(f"\nNesting {len(clips)} clip(s) into '{name}':")
-
-        # 1. Duplicate — this is what preserves per-clip settings
-        try:
-            nest = source.DuplicateTimeline(name)
-        except Exception as e:
-            self.say(f"DuplicateTimeline failed: {e}", True)
-            return
+        media_pool = project.GetMediaPool()
+        nest = media_pool.CreateEmptyTimeline(name)
         if not nest:
-            self.say("DuplicateTimeline returned nothing.", True)
+            self.say("CreateEmptyTimeline failed.", True)
             return
-        print(f"  duplicated timeline -> {nest.GetName()}")
+        done, total = clone_timeline_settings(source, nest)
+        print("\nCreated " + name + " - " + str(done) + "/" + str(total)
+              + " setting(s) matched  [" + format(time.time() - t0, ".2f") + "s]")
 
-        # 2. Strip the duplicate down to just the selection
-        removed = 0
-        try:
-            project.SetCurrentTimeline(nest)
-
-            # Only tracks that actually hold a kept clip need item-by-item
-            # inspection. Everything else is removed a whole track at a time,
-            # so the cost scales with the number of TRACKS rather than with
-            # every item on a long timeline.
-            kept_tracks = {(k, i) for (k, i, _s) in keep}
-
-            doomed = []
-            for kind, ti in sorted(kept_tracks):
-                for item in (nest.GetItemListInTrack(kind, ti) or []):
-                    try:
-                        if (kind, ti, item.GetStart()) in keep:
-                            continue
-                    except Exception:
-                        pass
-                    doomed.append(item)
-
-            if doomed:
-                if nest.DeleteClips(doomed):
-                    removed = len(doomed)
-                else:
-                    for i in range(0, len(doomed), 200):
-                        chunk = doomed[i:i + 200]
-                        if nest.DeleteClips(chunk):
-                            removed += len(chunk)
-
-            # Drop whole tracks that hold nothing we keep. Descending order
-            # keeps the remaining indices valid as we go.
-            dropped = 0
-            for kind in ("video", "audio"):
-                total = nest.GetTrackCount(kind) or 0
-                remaining = total
-                for ti in range(total, 0, -1):
-                    if (kind, ti) in kept_tracks:
-                        continue
-                    if kind == "video" and remaining <= 1:
-                        break
-                    try:
-                        if nest.DeleteTrack(kind, ti):
-                            dropped += 1
-                            remaining -= 1
-                    except Exception:
-                        pass
-            print(f"  stripped the nest: {removed} clip(s), {dropped} track(s) removed")
-        except Exception as e:
-            print(f"  WARNING: could not fully strip the nest: {e}")
-        finally:
+        precomps, created_bin = find_or_create_precomps(media_pool)
+        mpi = find_timeline_media_item(media_pool, name)
+        if precomps and mpi:
             try:
-                project.SetCurrentTimeline(source)
-            except Exception:
-                pass
+                media_pool.MoveClips([mpi], precomps)
+                print("  filed into " + PRECOMPS_BIN
+                      + (" (bin created)" if created_bin else ""))
+            except Exception as e:
+                print("  could not file into " + PRECOMPS_BIN + ": " + str(e))
 
-        # 3. Handle the originals — only now that the nest exists
+        # Everything step 2 needs, captured before we switch away
+        self.pending = {
+            "name": name, "source": source, "clips": clips,
+            "min_start": min(c["start"] for c in clips),
+            "max_end": max(c["end"] for c in clips),
+            "lowest": lowest, "highest": highest, "colour": colour,
+        }
+
+        project.SetCurrentTimeline(nest)
+        try:
+            nest.SetCurrentTimecode(nest.GetStartTimecode())
+        except Exception:
+            pass
+
+        self.step2_btn.config(state="normal")
+        self.say(name + " is open with the playhead on frame 1. Paste now, "
+                 "then click step 2.")
+
+    # -- step 2: put the nest back on the source timeline ----------------
+    def do_place(self):
+        if not getattr(self, "pending", None):
+            self.say("Run step 1 first.", True)
+            return
+        project = current_project()
+        info = self.pending
+        source, name = info["source"], info["name"]
+        media_pool = project.GetMediaPool()
+
+        nest = None
+        for i in range(1, (project.GetTimelineCount() or 0) + 1):
+            t = project.GetTimelineByIndex(i)
+            if t and t.GetName() == name:
+                nest = t
+                break
+        if not nest:
+            self.say("Could not find " + name + " any more.", True)
+            return
+
+        # Measure what was actually pasted, so it works wherever it landed
+        starts, ends = [], []
+        for kind in ("video", "audio"):
+            for ti in range(1, (nest.GetTrackCount(kind) or 0) + 1):
+                for item in (nest.GetItemListInTrack(kind, ti) or []):
+                    starts.append(item.GetStart())
+                    ends.append(item.GetEnd())
+        if not starts:
+            self.say(name + " is still empty - paste into it first, then "
+                     "click step 2.", True)
+            return
+
+        content_start, content_end = min(starts), max(ends)
+        duration = content_end - content_start
+        print("\nPlacing " + name + ": " + str(len(starts))
+              + " pasted item(s), " + str(duration) + " frames")
+
+        project.SetCurrentTimeline(source)
+
+        clips = info["clips"]
         mode = self.originals_var.get()
         handled, action = 0, "left alone"
         if mode == "Disable":
@@ -679,8 +716,8 @@ class NestPanel:
                 try:
                     if c["item"].SetClipEnabled(False):
                         handled += 1
-                except Exception as e:
-                    print(f"  could not disable {c['name']}: {e}")
+                except Exception:
+                    pass
             action = "disabled"
         elif mode == "Delete":
             try:
@@ -689,95 +726,64 @@ class NestPanel:
                 else:
                     action = "left alone (delete refused)"
             except Exception as e:
-                print(f"  DeleteClips failed: {e}")
+                print("  DeleteClips failed: " + str(e))
                 action = "left alone (delete failed)"
-        print(f"  {handled} original clip(s) {action}")
+        print("  " + str(handled) + " original clip(s) " + action)
 
-        # 4. Place the nest above, covering the same span
-        media_pool = project.GetMediaPool()
         mpi = find_timeline_media_item(media_pool, name)
         if not mpi:
-            self.say(f"Nest '{name}' created, but it wasn't found in the media "
-                     f"pool to place. Drag it in manually.", True)
+            self.say(name + " is not in the media pool - drag it in manually.", True)
             return
+
+        min_start = info["min_start"]
+        lowest, highest = info["lowest"], info["highest"]
+        target = None
+        for candidate in range(lowest, highest + 1):
+            if track_is_free(source, candidate, min_start, min_start + duration):
+                target = candidate
+                break
+        if target is None:
+            target = highest + 1
+            try:
+                source.AddTrack("video", {"index": target})
+            except Exception:
+                source.AddTrack("video")
+            print("  no free track in V" + str(lowest) + "-V" + str(highest)
+                  + "; inserted V" + str(target))
+        else:
+            print("  placing on existing V" + str(target))
 
         try:
             mpi_start = int(float(mpi.GetClipProperty("Start") or 0))
         except Exception:
             mpi_start = 0
-        offset = min_start - (source.GetStartFrame() or 0)
+        offset = content_start - (nest.GetStartFrame() or 0)
         start_frame = mpi_start + offset
-        # Place the nest where the selection sat, without breaking layer order.
-        # Search upward from the lowest selected track for a track that is
-        # actually clear across the span. Anything the originals still occupy
-        # (Disable / Leave as is) counts as blocked, since they are physically
-        # still there. Staying within the selection's own track range means the
-        # nest can never end up above clips that were above the selection.
-        target_track = None
-        for candidate in range(lowest_track, highest_track + 1):
-            if track_is_free(source, candidate, min_start, max_end):
-                target_track = candidate
-                break
 
-        if target_track is None:
-            # Every track the selection spanned is blocked, so make room
-            # directly above it — still below whatever sat above the selection.
-            insert_at = highest_track + 1
-            try:
-                source.AddTrack("video", {"index": insert_at})
-            except Exception:
-                source.AddTrack("video")
-            target_track = insert_at
-            print(f"  no free track in V{lowest_track}-V{highest_track}; "
-                  f"inserted a new V{insert_at}")
-        else:
-            print(f"  placing on existing V{target_track}")
-
-        clip_info = {
+        placed = media_pool.AppendToTimeline([{
             "mediaPoolItem": mpi,
             "startFrame": start_frame,
-            "endFrame": start_frame + (max_end - min_start),
-            "trackIndex": target_track,
+            "endFrame": start_frame + duration,
+            "trackIndex": target,
             "recordFrame": min_start,
-        }
-        if not (include_audio and has_audio):
-            clip_info["mediaType"] = 1      # video only; omitting it brings audio too
-        elif (source.GetTrackCount("audio") or 0) < 1:
-            source.AddTrack("audio")
+        }])
 
-        placed = media_pool.AppendToTimeline([clip_info])
-
-        # Carry the first clip's colour onto the nest
-        if placed and source_colour:
+        if placed and info["colour"]:
             try:
-                if placed[0].SetClipColor(source_colour):
-                    print(f"  coloured the nest {source_colour}")
-            except Exception as e:
-                print(f"  could not set clip colour: {e}")
-
-        # File the nest alongside the other pre-comps
-        filed = ""
-        precomps, created_bin = find_or_create_precomps(media_pool)
-        if precomps:
-            try:
-                if media_pool.MoveClips([mpi], precomps):
-                    filed = " Filed into " + PRECOMPS_BIN + "."
-                    print("  moved into the " + PRECOMPS_BIN + " bin"
-                          + (" (bin created)" if created_bin else ""))
-                else:
-                    print("  could not move the nest into " + PRECOMPS_BIN)
-            except Exception as e:
-                print("  MoveClips failed: " + str(e))
+                placed[0].SetClipColor(info["colour"])
+            except Exception:
+                pass
 
         if placed:
-            print(f"  placed nest on V{target_track} at frame {min_start}")
-            self.say(f"Created '{name}' — {len(clips)} clip(s) nested, "
-                     f"{handled} original(s) {action}, placed on V{target_track}."
-                     + filed)
+            print("  placed on V" + str(target) + " at frame " + str(min_start))
+            self.say(name + " placed on V" + str(target) + ". "
+                     + str(handled) + " original(s) " + action + ".")
         else:
-            print("  FAILED to place the nest on the timeline")
-            self.say(f"Created '{name}' but could not place it — "
-                     f"drag it from the media pool onto V{target_track}." + filed, True)
+            self.say("Could not place " + name + " - drag it onto V"
+                     + str(target) + " from " + PRECOMPS_BIN + ".", True)
+
+        self.pending = None
+        self.step2_btn.config(state="disabled")
         self.rescan()
 
     def _on_close(self):
