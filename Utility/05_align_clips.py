@@ -173,6 +173,10 @@ def item_uid(item):
 
 SELECTION_PASSES = 3
 
+COMPOUND_HINT = (
+    'Nothing selected. Note: clips inside a COMPOUND CLIP are invisible to the API - Resolve reports the parent timeline instead. Use a nested timeline or Fusion clip if you need to align inside a container.'
+)
+
 
 def selected_clips():
     """Selected timeline items on VIDEO tracks only.
@@ -792,7 +796,7 @@ class AlignPanel:
         self.tl_label.config(text=timeline.GetName())
         clips, skipped = selected_clips()
         self._set_count(len(clips), skipped)
-        self.say("Ready." if clips else "Select clips on the timeline.")
+        self.say("Ready." if clips else COMPOUND_HINT, error=not clips)
 
     def _set_count(self, count, skipped):
         text = f"{count} video clip(s) selected"
@@ -810,7 +814,10 @@ class AlignPanel:
         clips, skipped = selected_clips()
         self._set_count(len(clips), skipped)
         if len(clips) < minimum:
-            self.say(f"Select at least {minimum} video clip(s) (found {len(clips)}).", True)
+            if not clips:
+                self.say(COMPOUND_HINT, True)
+            else:
+                self.say(f"Select at least {minimum} video clip(s) (found {len(clips)}).", True)
             return None
         tl_w, tl_h = timeline_resolution(project)
         self.tl_w, self.tl_h = tl_w, tl_h
