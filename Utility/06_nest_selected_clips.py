@@ -49,6 +49,11 @@ BTN_HOVER = "#454545"
 ACCENT = "#3d7fd6"
 ACCENT_HOVER = "#4a90e8"
 
+CLIP_COLOURS = ["Orange", "Apricot", "Yellow", "Lime", "Olive", "Green",
+                "Teal", "Navy", "Blue", "Purple", "Violet", "Pink", "Tan",
+                "Beige", "Brown", "Chocolate"]
+COLOUR_CHOICES = ["From first clip"] + CLIP_COLOURS + ["None"]
+
 SCALE_CHOICES = ["Auto", "100%", "125%", "150%", "175%", "200%", "250%"]
 SCALE = 1.0
 SELECTION_PASSES = 3
@@ -474,12 +479,20 @@ class NestPanel:
                        activeforeground=FG, font=FONT(9), highlightthickness=0,
                        anchor="w").pack(fill="x")
 
-        self.colour_var = tk.BooleanVar(value=bool(self.prefs.get("match_colour", True)))
-        tk.Checkbutton(opts, text="Give the nest the first clip's colour",
-                       variable=self.colour_var, command=self._save_opts,
-                       bg=BG, fg=FG, selectcolor=PANEL, activebackground=BG,
-                       activeforeground=FG, font=FONT(9), highlightthickness=0,
-                       anchor="w").pack(fill="x")
+        colour_row = tk.Frame(opts, bg=BG)
+        colour_row.pack(fill="x", pady=(S(4), 0))
+        tk.Label(colour_row, text="Nest colour", bg=BG, fg=SUB, font=FONT(9),
+                 width=10, anchor="w").pack(side="left")
+        self.colour_var = tk.StringVar(
+            value=self.prefs.get("nest_colour", "From first clip"))
+        colour_box = ttk.Combobox(colour_row, textvariable=self.colour_var,
+                                  values=COLOUR_CHOICES, state="readonly",
+                                  width=16, font=FONT(9))
+        colour_box.pack(side="left")
+        colour_box.bind("<<ComboboxSelected>>", lambda e: self._save_opts())
+        tk.Label(colour_row,
+                 text="pick a colour if your clips have none set",
+                 bg=BG, fg=SUB, font=FONT(8)).pack(side="left", padx=(S(10), 0))
 
         table = tk.Frame(content, bg=BG)
         table.pack(fill="both", expand=True, padx=S(14), pady=(S(10), 0))
@@ -538,7 +551,7 @@ class NestPanel:
     def _save_opts(self):
         self.prefs["originals"] = self.originals_var.get()
         self.prefs["include_audio"] = bool(self.audio_var.get())
-        self.prefs["match_colour"] = bool(self.colour_var.get())
+        self.prefs["nest_colour"] = self.colour_var.get()
         save_prefs(self.prefs)
 
     def _on_audio_toggle(self):
@@ -596,7 +609,7 @@ class NestPanel:
             if self.audio_var.get():
                 detail += f" · {audios} audio"
             self.info.config(text=f"{detail} · {span} frames")
-            self.say("Ready.")
+            self.say("Step 1 creates the nest and opens it - then just paste.")
         else:
             self.info.config(text="0 clips selected")
             self.say("Select clips on the timeline. Clips inside a compound clip "
@@ -621,13 +634,6 @@ class NestPanel:
                 highest = c["idx"] if highest is None else max(highest, c["idx"])
         lowest = lowest or 1
         highest = highest or lowest
-
-        colour = ""
-        if self.colour_var.get():
-            try:
-                colour = clips[0]["item"].GetClipColor() or ""
-            except Exception:
-                colour = ""
 
         name = unique_timeline_name(project, self.name_var.get().strip() or "Nest")
         t0 = time.time()
@@ -656,7 +662,7 @@ class NestPanel:
             "name": name, "source": source, "clips": clips,
             "min_start": min(c["start"] for c in clips),
             "max_end": max(c["end"] for c in clips),
-            "lowest": lowest, "highest": highest, "colour": colour,
+            "lowest": lowest, "highest": highest,
         }
 
         project.SetCurrentTimeline(nest)
@@ -689,13 +695,20 @@ class NestPanel:
             self.say("Could not find " + name + " any more.", True)
             return
 
-        # Measure what was actually pasted, so it works wherever it landed
+        # Measure what was actually pasted, so it works wherever it landed.
+        # The colour is taken from the earliest VIDEO clip in the nest rather
+        # than from the original selection - the pasted content is the real
+        # source of truth, and the originals often carry no colour at all.
         starts, ends = [], []
+        first_item, first_start = None, None
         for kind in ("video", "audio"):
             for ti in range(1, (nest.GetTrackCount(kind) or 0) + 1):
                 for item in (nest.GetItemListInTrack(kind, ti) or []):
-                    starts.append(item.GetStart())
+                    begin = item.GetStart()
+                    starts.append(begin)
                     ends.append(item.GetEnd())
+                    if kind == "video" and (first_start is None or begin < first_start):
+                        first_item, first_start = item, begin
         if not starts:
             self.say(name + " is still empty - paste into it first, then "
                      "click step 2.", True)
@@ -705,6 +718,23 @@ class NestPanel:
         duration = content_end - content_start
         print("\nPlacing " + name + ": " + str(len(starts))
               + " pasted item(s), " + str(duration) + " frames")
+
+        choice = self.colour_var.get()
+        colour = ""
+        if choice == "From first clip":
+            if first_item is not None:
+                try:
+                    colour = first_item.GetClipColor() or ""
+                except Exception as e:
+                    print("  could not read the first clip colour: " + str(e))
+            if colour:
+                print("  colour from '" + first_item.GetName() + "': " + colour)
+            else:
+                print("  the first pasted clip has no colour set - pick an "
+                      "explicit Nest colour if you want one applied")
+        elif choice and choice != "None":
+            colour = choice
+            print("  using the chosen nest colour: " + colour)
 
         project.SetCurrentTimeline(source)
 
@@ -768,16 +798,28 @@ class NestPanel:
             "recordFrame": min_start,
         }])
 
-        if placed and info["colour"]:
+        if colour:
+            if placed:
+                try:
+                    if placed[0].SetClipColor(colour):
+                        print("  coloured the timeline clip " + colour)
+                    else:
+                        print("  SetClipColor(" + colour + ") was refused")
+                except Exception as e:
+                    print("  SetClipColor failed: " + str(e))
+            # Colour the media pool entry too, so the nest is easy to spot in
+            # the PreComps bin as well as on the timeline.
             try:
-                placed[0].SetClipColor(info["colour"])
-            except Exception:
-                pass
+                if mpi.SetClipColor(colour):
+                    print("  coloured the media pool item " + colour)
+            except Exception as e:
+                print("  media pool SetClipColor failed: " + str(e))
 
         if placed:
             print("  placed on V" + str(target) + " at frame " + str(min_start))
             self.say(name + " placed on V" + str(target) + ". "
-                     + str(handled) + " original(s) " + action + ".")
+                     + str(handled) + " original(s) " + action
+                     + ((" Coloured " + colour + ".") if colour else ""))
         else:
             self.say("Could not place " + name + " - drag it onto V"
                      + str(target) + " from " + PRECOMPS_BIN + ".", True)
@@ -792,7 +834,7 @@ class NestPanel:
             self.prefs["geometry_scale"] = round(SCALE, 3)
             self.prefs["originals"] = self.originals_var.get()
             self.prefs["include_audio"] = bool(self.audio_var.get())
-            self.prefs["match_colour"] = bool(self.colour_var.get())
+            self.prefs["nest_colour"] = self.colour_var.get()
             save_prefs(self.prefs)
         except Exception:
             pass
@@ -803,6 +845,7 @@ prefs = load_prefs()
 root = tk.Tk()
 SCALE = resolve_scale(prefs, root)
 app = NestPanel(root)
+root.bind("<Escape>", lambda e: app._on_close())
 root.lift()
 root.attributes("-topmost", True)
 if not prefs.get("always_on_top", True):

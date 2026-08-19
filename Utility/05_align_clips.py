@@ -922,6 +922,7 @@ prefs = load_prefs()
 root = tk.Tk()
 SCALE = resolve_scale(prefs, root)
 app = AlignPanel(root)
+root.bind("<Escape>", lambda e: app._on_close())
 root.lift()
 root.attributes("-topmost", True)
 if not prefs.get("always_on_top", False):
