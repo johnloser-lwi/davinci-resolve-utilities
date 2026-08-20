@@ -116,6 +116,20 @@ def save_prefs(prefs):
         print(f"Could not save prefs: {e}")
 
 
+def style_button(btn, primary=False):
+    """Re-colour a button after creation.
+
+    The hover handlers close over the original colours, so they have to be
+    rebound too - otherwise moving the mouse away repaints the old style.
+    """
+    base = ACCENT if primary else BTN
+    hover = ACCENT_HOVER if primary else BTN_HOVER
+    btn.config(bg=base, fg="#ffffff" if primary else FG,
+               activebackground=hover)
+    btn.bind("<Enter>", lambda e: btn.config(bg=hover))
+    btn.bind("<Leave>", lambda e: btn.config(bg=base))
+
+
 def make_button(parent, text, command, primary=False):
     base = ACCENT if primary else BTN
     hover = ACCENT_HOVER if primary else BTN_HOVER
@@ -506,8 +520,9 @@ class NestPanel:
 
         actions = tk.Frame(content, bg=BG)
         actions.pack(fill="x", padx=S(14), pady=(S(12), 0))
-        make_button(actions, "1 - Create nest timeline", self.do_create,
-                    primary=True).pack(side="left")
+        self.step1_btn = make_button(actions, "1 - Create nest timeline",
+                                     self.do_create, primary=True)
+        self.step1_btn.pack(side="left")
         self.step2_btn = make_button(actions, "2 - Pasted, place it",
                                      self.do_place)
         self.step2_btn.pack(side="left", padx=(S(8), 0))
@@ -617,6 +632,12 @@ class NestPanel:
 
     # -- step 1: make the empty nest ------------------------------------
     def do_create(self):
+        # One nest per window. A second run would strand the first timeline and
+        # leave step 2 pointing at the wrong one.
+        if getattr(self, "pending", None):
+            self.say("A nest is already waiting - paste into it, then click "
+                     "step 2. Reopen this window to start another.", True)
+            return
         project = current_project()
         source = current_timeline()
         if not project or not source:
@@ -671,7 +692,11 @@ class NestPanel:
         except Exception:
             pass
 
+        # Hand the highlight over: step 1 is done, step 2 is what's next
+        self.step1_btn.config(state="disabled", text="1 - Nest created")
+        style_button(self.step1_btn, primary=False)
         self.step2_btn.config(state="normal")
+        style_button(self.step2_btn, primary=True)
         self.say(name + " is open with the playhead on frame 1. Paste now, "
                  "then click step 2.")
 
