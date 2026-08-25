@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk
 
@@ -42,6 +43,7 @@ ACCENT_HOVER = "#4a90e8"
 SCALE_CHOICES = ["Auto", "100%", "125%", "150%", "175%", "200%", "250%"]
 SCALE = 1.0
 SELECTION_PASSES = 3
+RECENT_LIMIT = 8        # parameters remembered per tool type
 
 
 def S(n):
@@ -273,12 +275,18 @@ def scan(clips):
                     start = clip.GetStart()
                 except Exception:
                     start = 0
+                # 'key' identifies the node across rescans so a row selection
+                # survives a refresh. It must key off the CLIP's unique id,
+                # not its start frame: stacked titles on V1..V4 share a start
+                # frame and often share node names too, and two rows with the
+                # same key collide as Treeview ids and blank the table.
                 groups.setdefault(reg, []).append({
                     "clip": clip.GetName(),
                     "clip_start": start,
                     "comp": comp,
                     "tool": tool,
                     "tool_name": tool.Name,
+                    "key": f"{item_uid(clip)}.{ci}.{tool.Name}",
                 })
     return groups, comps
 
@@ -287,8 +295,75 @@ MAX_INPUTS = 400        # hard cap on inputs examined per tool
 FALLBACK_PROBES = 20    # GetInput() calls allowed when metadata is inconclusive
 
 
+STAR = "★  "
+
+
+def base_of(label):
+    """A displayed label with any recently-used star removed."""
+    text = str(label or "")
+    return text[len(STAR):] if text.startswith(STAR) else text
+
+
+def make_param(label, input_id, axis, kind):
+    """A parameter row. 'base' is the label without any decoration, so the
+    recently-used list stays stable when a star is prefixed for display."""
+    return {"label": label, "base": label, "id": input_id,
+            "axis": axis, "kind": kind}
+
+
+def input_object(tool, input_id):
+    """The Input object behind an input id — needed for expressions, which
+    live on the Input, not on the tool.
+
+    This walks GetInputList() and is only ever called on demand (when you set
+    or clear an expression), never during a refresh: a heavy plugin can have
+    hundreds of inputs and doing this per node per redraw is exactly the kind
+    of thing that stalls Resolve.
+    """
+    try:
+        inputs = tool.GetInputList() or {}
+    except Exception:
+        return None
+    for inp in list(inputs.values())[:MAX_INPUTS]:
+        try:
+            if (inp.GetAttrs() or {}).get("INPS_ID") == input_id:
+                return inp
+        except Exception:
+            continue
+    return None
+
+
+def read_value(tool, param):
+    """Current value of a parameter — float for numbers, str for text."""
+    if param["kind"] == "text":
+        value = tool.GetInput(param["id"])
+        return "" if value is None else str(value)
+    return get_param(tool, param["id"], param["axis"])
+
+
+def set_text(tool, input_id, text):
+    try:
+        tool.SetInput(input_id, str(text))
+    except Exception as e:
+        print(f"    SetInput({input_id}) failed: {e}")
+        return False
+    try:
+        return str(tool.GetInput(input_id) or "") == str(text)
+    except Exception:
+        return True
+
+
+def expand_tokens(template, index, entry):
+    """{n} 1-based row number, {i} 0-based, {clip}, {node}."""
+    return (str(template)
+            .replace("{n}", str(index + 1))
+            .replace("{i}", str(index))
+            .replace("{clip}", str(entry["clip"]))
+            .replace("{node}", str(entry["tool_name"])))
+
+
 def parameters_of(tool):
-    """Editable numeric/point parameters, as (label, input_id, axis).
+    """Editable parameters, as dicts with label / id / axis / kind.
 
     Classification comes from each input's METADATA, not by reading its value.
     Calling GetInput() on every input of a heavy OFX plugin is slow enough to
@@ -322,8 +397,10 @@ def parameters_of(tool):
             kind = "point"
         elif dtype == "Number":
             kind = "number"
+        elif dtype == "Text":
+            kind = "text"
         elif dtype:
-            kind = None          # Text, Image, Mask, Gradient, FontStyle...
+            kind = None          # Image, Mask, Gradient, FontStyle...
         elif probes_left > 0:
             # No usable metadata — fall back to reading the value, but only
             # for a bounded number of inputs so this can never run away.
@@ -337,10 +414,12 @@ def parameters_of(tool):
 
         suffix = "" if str(name) == str(input_id) else f"   ·   {input_id}"
         if kind == "number":
-            params.append((f"{name}{suffix}", input_id, None))
+            params.append(make_param(f"{name}{suffix}", input_id, None, "number"))
+        elif kind == "text":
+            params.append(make_param(f"{name}{suffix}", input_id, None, "text"))
         elif kind == "point":
-            params.append((f"{name}.X{suffix}", input_id, 0))
-            params.append((f"{name}.Y{suffix}", input_id, 1))
+            params.append(make_param(f"{name}.X{suffix}", input_id, 0, "number"))
+            params.append(make_param(f"{name}.Y{suffix}", input_id, 1, "number"))
     return params
 
 
@@ -566,6 +645,23 @@ class MultiEditor:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=S(width), anchor="w")
         self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._paint_scope())
+
+        scope = tk.Frame(content, bg=BG)
+        scope.pack(fill="x", padx=S(14), pady=(S(6), 0))
+        self.sel_only_var = tk.BooleanVar(
+            value=bool(self.prefs.get("selected_rows_only", True)))
+        tk.Checkbutton(scope, text="Only rows selected above", variable=self.sel_only_var,
+                       command=self._on_scope_change, bg=BG, fg=FG, selectcolor=PANEL,
+                       activebackground=BG, activeforeground=FG, font=FONT(9),
+                       highlightthickness=0).pack(side="left")
+        self.scope_label = tk.Label(scope, text="", bg=BG, fg=SUB, font=FONT(8))
+        self.scope_label.pack(side="left", padx=(S(8), 0))
+        make_button(scope, "Select all",
+                    self.select_all_rows).pack(side="right")
+        make_button(scope, "Clear selection",
+                    lambda: self.tree.selection_remove(self.tree.selection())
+                    ).pack(side="right", padx=(0, S(6)))
 
         ops = tk.Frame(content, bg=BG)
         ops.pack(fill="x", padx=S(14), pady=(S(12), 0))
@@ -599,9 +695,38 @@ class MultiEditor:
         self._entry(r2, self.to_var, 7).pack(side="left")
         make_button(r2, "Spread", lambda: self.do_spread(True)).pack(side="left", padx=(S(8), 0))
 
+        r3 = tk.Frame(ops, bg=BG)
+        r3.pack(fill="x", pady=(S(6), 0))
+        tk.Label(r3, text="Text", bg=BG, fg=SUB, font=FONT(9), width=9,
+                 anchor="w").pack(side="left")
+        self.text_var = tk.StringVar()
+        tk.Entry(r3, textvariable=self.text_var, bg=PANEL, fg=FG, relief="flat",
+                 insertbackground=FG, font=FONT(9), highlightthickness=1,
+                 highlightbackground=BORDER, highlightcolor=ACCENT
+                 ).pack(side="left", fill="x", expand=True, ipady=S(3))
+        make_button(r3, "Apply", self.do_text).pack(side="left", padx=(S(8), 0))
+
+        r4 = tk.Frame(ops, bg=BG)
+        r4.pack(fill="x", pady=(S(6), 0))
+        tk.Label(r4, text="Expression", bg=BG, fg=SUB, font=FONT(9), width=9,
+                 anchor="w").pack(side="left")
+        self.expr_var = tk.StringVar()
+        tk.Entry(r4, textvariable=self.expr_var, bg=PANEL, fg=FG, relief="flat",
+                 insertbackground=FG, font=MONO(9), highlightthickness=1,
+                 highlightbackground=BORDER, highlightcolor=ACCENT
+                 ).pack(side="left", fill="x", expand=True, ipady=S(3))
+        make_button(r4, "Set", self.do_expression).pack(side="left", padx=(S(8), 0))
+        make_button(r4, "Clear", self.clear_expression).pack(side="left", padx=(S(6), 0))
+
         tk.Label(content, text="The numbered table is the exact operation order. "
                                "Ordering by Value means Spread runs from the lowest "
-                               "current value to the highest, so selection order never matters.",
+                               "current value to the highest, so selection order never matters. "
+                               "Recently used parameters are starred and float to the top of "
+                               "the list, per tool type.\n"
+                               "Text and Expression accept  {n}  (row number),  {i}  "
+                               "(from 0),  {clip}  and  {node}  — so each node can get a "
+                               "different value. An expression is Fusion's own syntax, e.g. "
+                               "time/24  or  Transform1.Angle*2.",
                  bg=BG, fg=SUB, font=FONT(8), anchor="w", justify="left",
                  wraplength=S(520)).pack(fill="x", padx=S(14), pady=(S(8), S(14)))
 
@@ -668,6 +793,15 @@ class MultiEditor:
 
     # -- scanning ---------------------------------------------------------
     def rescan(self):
+        """Never let a scan fail silently - a half-updated panel looks exactly
+        like 'it stopped seeing my clips', which is impossible to diagnose."""
+        try:
+            self._rescan()
+        except Exception as e:
+            traceback.print_exc()
+            self.say(f"Scan failed: {e}", True)
+
+    def _rescan(self):
         timeline = current_timeline()
         if not timeline:
             self.tl_label.config(text="No timeline open")
@@ -704,27 +838,84 @@ class MultiEditor:
         label = self.group_var.get()
         return label.split()[0] if label else None
 
+    # -- recently used ----------------------------------------------------
+    def recent_for(self, reg):
+        """Most-recently-used parameter names for this tool type."""
+        store = self.prefs.get("recent_params") or {}
+        got = store.get(reg or "", [])
+        return got if isinstance(got, list) else []
+
+    def remember_param(self, param):
+        """Called when a parameter is actually EDITED, not merely looked at —
+        'recently used' is only useful if it tracks real work."""
+        reg = self.current_group()
+        if not reg or not param:
+            return
+        store = self.prefs.setdefault("recent_params", {})
+        recent = [b for b in self.recent_for(reg) if b != param["base"]]
+        store[reg] = ([param["base"]] + recent)[:RECENT_LIMIT]
+        save_prefs(self.prefs)
+        self._reorder_params()
+
+    def order_params(self, params, reg):
+        """Recently used first, starred; everything else in the tool's own order."""
+        rank = {base: i for i, base in enumerate(self.recent_for(reg))}
+        for p in params:
+            p["label"] = p["base"]      # clear stars from a previous ordering
+        hot = sorted((p for p in params if p["base"] in rank),
+                     key=lambda p: rank[p["base"]])
+        rest = [p for p in params if p["base"] not in rank]
+        for p in hot:
+            p["label"] = STAR + p["base"]
+        return hot + rest
+
+    def _reorder_params(self):
+        """Re-apply the recent-first ordering in place, keeping the current
+        selection selected under its new (possibly starred) label."""
+        current = self.current_param()
+        self.params = self.order_params(self.params, self.current_group())
+        if current:
+            self.param_var.set(current["label"])
+        self.apply_param_filter()
+
     def on_group_change(self):
         reg = self.current_group()
         self.entries = self.groups.get(reg, [])
         if reg:
             self.prefs["last_group"] = reg
             save_prefs(self.prefs)
-        self.params = parameters_of(self.entries[0]["tool"]) if self.entries else []
-        labels = [p[0] for p in self.params]
-        if labels:
-            remembered = self.prefs.get("last_param")
-            self.param_var.set(remembered if remembered in labels else labels[0])
-        else:
-            self.param_var.set("")
+        params = parameters_of(self.entries[0]["tool"]) if self.entries else []
+        self.params = self.order_params(params, reg)
+        self.param_var.set(self._param_to_keep(reg))
         self.apply_param_filter()
         self.refresh_values()
+
+    def _param_to_keep(self, reg):
+        """Which parameter should be selected after a (re)scan.
+
+        Whatever is on screen wins. Auto-rescan fires every time you click
+        back from Resolve, so resetting to the top of the list here means the
+        parameter you just picked is taken away from under you.
+
+        Matching is on the base name, because starring a parameter changes its
+        displayed label.
+        """
+        by_base = {}
+        for p in self.params:
+            by_base.setdefault(p["base"], p["label"])
+        if not by_base:
+            return ""
+        for candidate in (base_of(self.param_var.get()),
+                          (self.prefs.get("last_param_by_group") or {}).get(reg or "")):
+            if candidate in by_base:
+                return by_base[candidate]
+        return self.params[0]["label"]
 
     def apply_param_filter(self):
         """Narrow the parameter dropdown. Matches name, input id and axis, so
         typing 'center' or 'blur' cuts a long list down fast."""
         query = self.filter_var.get().strip().lower() if hasattr(self, "filter_var") else ""
-        labels = [p[0] for p in self.params]
+        labels = [p["label"] for p in self.params]
         shown = [l for l in labels if query in l.lower()] if query else labels
         self.param_box["values"] = shown
         total = len(labels)
@@ -738,7 +929,7 @@ class MultiEditor:
     def current_param(self):
         label = self.param_var.get()
         for p in self.params:
-            if p[0] == label:
+            if p["label"] == label:
                 return p
         return None
 
@@ -749,73 +940,165 @@ class MultiEditor:
         self.refresh_values()
 
     def refresh_values(self):
+        try:
+            self._refresh_values()
+        except Exception as e:
+            traceback.print_exc()
+            self.say(f"Could not read values: {e}", True)
+
+    def _refresh_values(self):
         """Read every value and build self.rows in the exact order operations
         will use — the table shows that order, numbered, so nothing is guesswork."""
+        keep = set(self.tree.selection()) if self.tree.get_children() else set()
         self.tree.delete(*self.tree.get_children())
         self.rows = []
         param = self.current_param()
         if not param:
+            self._paint_scope()
             return
-        self.prefs["last_param"] = param[0]
+        self.prefs.setdefault("last_param_by_group", {})[
+            self.current_group() or ""] = param["base"]
         save_prefs(self.prefs)
-        _, input_id, axis = param
 
         rows = []
         for entry in self.entries:
             try:
-                value = get_param(entry["tool"], input_id, axis)
+                value = read_value(entry["tool"], param)
             except Exception:
                 value = None
             rows.append({"entry": entry, "value": value})
 
         # Unreadable values sort last and are never used as spread endpoints
+        is_text = param["kind"] == "text"
+        blank = "" if is_text else 0.0
         order = self.order_var.get()
         if order == "Timeline position":
             rows.sort(key=lambda r: (r["value"] is None, r["entry"]["clip_start"]))
         elif order == "Node name":
             rows.sort(key=lambda r: (r["value"] is None, r["entry"]["tool_name"].lower()))
+        elif is_text:
+            rows.sort(key=lambda r: (r["value"] is None,
+                                     str(r["value"] if r["value"] is not None else "").lower()))
         else:  # Value
             rows.sort(key=lambda r: (r["value"] is None,
-                                     r["value"] if r["value"] is not None else 0.0))
+                                     r["value"] if r["value"] is not None else blank))
         if self.reverse_var.get():
             rows = list(reversed(rows))
 
         self.rows = rows
+        seen = set()
         for i, row in enumerate(rows, start=1):
             value = row["value"]
-            self.tree.insert("", "end", values=(
-                i, row["entry"]["clip"], row["entry"]["tool_name"],
-                "—" if value is None else f"{value:.4g}"))
+            # Stable per-node iid, so the row selection survives a refresh
+            # rather than silently widening the next operation.
+            # Belt and braces: a duplicate id would make insert() throw and
+            # leave the table half-drawn, so never let one through.
+            iid = f"n{row['entry']['key']}"
+            while iid in seen:
+                iid += "_"
+            seen.add(iid)
+            row["iid"] = iid
+            if value is None:
+                shown = "—"
+            elif is_text:
+                shown = str(value).replace("\n", " ⏎ ")[:60] or "(empty)"
+            else:
+                shown = f"{value:.4g}"
+            self.tree.insert("", "end", iid=row["iid"], values=(
+                i, row["entry"]["clip"], row["entry"]["tool_name"], shown))
 
-        usable = [r for r in rows if r["value"] is not None]
-        if usable:
-            lo, hi = usable[0]["value"], usable[-1]["value"]
-            self.say(f"{len(rows)} node(s) — {param[0]}   "
-                     f"ends: {lo:.4g} → {hi:.4g}")
+        restore = [r["iid"] for r in rows if r["iid"] in keep]
+        if restore:
+            self.tree.selection_set(restore)
+
+        if is_text:
+            self.say(f"{len(rows)} node(s) — {param['base']}   (text — use the Text row)")
         else:
-            self.say(f"{len(rows)} node(s) — {param[0]}")
+            usable = [r for r in rows if r["value"] is not None]
+            if usable:
+                lo, hi = usable[0]["value"], usable[-1]["value"]
+                self.say(f"{len(rows)} node(s) — {param['base']}   "
+                         f"ends: {lo:.4g} → {hi:.4g}")
+            else:
+                self.say(f"{len(rows)} node(s) — {param['base']}")
+        self._paint_scope()
+
+    # -- which rows an operation touches ----------------------------------
+    def _on_scope_change(self):
+        self.prefs["selected_rows_only"] = bool(self.sel_only_var.get())
+        save_prefs(self.prefs)
+        self._paint_scope()
+
+    def select_all_rows(self):
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids)
+
+    def _paint_scope(self):
+        total = len(getattr(self, "rows", []))
+        n = len(self._scoped(getattr(self, "rows", [])))
+        if not total:
+            text = ""
+        elif n == total:
+            text = f"acting on all {total} node(s)"
+        else:
+            text = f"acting on {n} of {total} node(s)"
+        try:
+            self.scope_label.config(text=text)
+        except Exception:
+            pass
+
+    def _scoped(self, rows):
+        """Narrow rows to the table selection.
+
+        A selection of nothing means 'everything' — otherwise the panel would
+        sit there refusing to do anything until you clicked a row.
+        """
+        if not rows or not self.sel_only_var.get():
+            return rows
+        chosen = set(self.tree.selection())
+        if not chosen:
+            return rows
+        return [r for r in rows if r.get("iid") in chosen]
 
     # -- operations -------------------------------------------------------
-    def _prepared(self):
+    def _prepared(self, kind="number"):
+        """The parameter and the rows an operation should touch.
+
+        Rows are narrowed to the table selection here, so every operation
+        respects it without having to remember to ask.
+        """
         param = self.current_param()
         if not param:
             self.say("Pick a tool and parameter first.", True)
             return None, None
-        rows = [r for r in getattr(self, "rows", []) if r["value"] is not None]
+        if kind == "number" and param["kind"] == "text":
+            self.say(f"{param['base']} is a text parameter — use the Text row "
+                     "or an expression.", True)
+            return None, None
+        if kind == "text" and param["kind"] != "text":
+            self.say(f"{param['base']} is not a text parameter.", True)
+            return None, None
+        rows = [r for r in self._scoped(getattr(self, "rows", []))
+                if r["value"] is not None]
         if not rows:
             self.say("Nothing to edit — rescan with clips selected.", True)
             return None, None
         return param, rows
+
+    def _header(self, label, rows):
+        scope = "selected " if len(rows) != len(getattr(self, "rows", [])) else ""
+        print(f"\n{label} — on {len(rows)} {scope}node(s), "
+              f"ordered by {self.order_var.get().lower()}"
+              f"{' (reversed)' if self.reverse_var.get() else ''}:")
 
     def _apply(self, rows, values, label):
         """values: list matching the given rows, which are in display order."""
         param = self.current_param()
         if not param:
             return
-        _, input_id, axis = param
-        print(f"\n{label} — {param[0]} on {len(rows)} node(s), "
-              f"ordered by {self.order_var.get().lower()}"
-              f"{' (reversed)' if self.reverse_var.get() else ''}:")
+        input_id, axis = param["id"], param["axis"]
+        self._header(f"{label} — {param['base']}", rows)
         ok_count = 0
         for i, (row, new_value) in enumerate(zip(rows, values), start=1):
             entry = row["entry"]
@@ -824,6 +1107,7 @@ class MultiEditor:
             ok_count += 1 if good else 0
             print(f"  {i:>2}. {entry['clip'][:26]:28} {entry['tool_name'][:16]:18} "
                   f"{before:>10.4g} -> {new_value:<10.4g} {'' if good else '(FAILED)'}")
+        self.remember_param(param)
         nudge_playhead()
         self.refresh_values()
         self.say(f"{label}: {ok_count} of {len(rows)} node(s) updated.")
@@ -878,6 +1162,79 @@ class MultiEditor:
 
         step = (end - start) / float(len(rows) - 1)
         self._apply(rows, [start + step * i for i in range(len(rows))], label)
+
+    def do_text(self):
+        param, rows = self._prepared("text")
+        if not param:
+            return
+        template = self.text_var.get()
+        self._header(f"Set text — {param['base']}", rows)
+        ok_count = 0
+        for i, row in enumerate(rows):
+            entry = row["entry"]
+            new_text = expand_tokens(template, i, entry)
+            good = set_text(entry["tool"], param["id"], new_text)
+            ok_count += 1 if good else 0
+            print(f"  {i + 1:>2}. {entry['clip'][:26]:28} "
+                  f"{entry['tool_name'][:16]:18} -> {new_text[:40]!r} "
+                  f"{'' if good else '(FAILED)'}")
+        self.remember_param(param)
+        nudge_playhead()
+        self.refresh_values()
+        self.say(f"Set text: {ok_count} of {len(rows)} node(s) updated.")
+
+    def _write_expression(self, expr, label):
+        """Expressions live on the Input object, not the tool.
+
+        For a point parameter the expression drives the WHOLE point, not the
+        .X / .Y row you happen to have selected — Fusion has no per-axis
+        expression — so it has to be written as Point(x, y).
+        """
+        param = self.current_param()
+        if not param:
+            self.say("Pick a tool and parameter first.", True)
+            return
+        rows = self._scoped(getattr(self, "rows", []))
+        if not rows:
+            self.say("Nothing to edit — rescan with clips selected.", True)
+            return
+
+        self._header(f"{label} — {param['base']}", rows)
+        ok_count = 0
+        for i, row in enumerate(rows):
+            entry = row["entry"]
+            inp = entry.get("input_" + str(param["id"]))
+            if inp is None:
+                inp = input_object(entry["tool"], param["id"])
+                entry["input_" + str(param["id"])] = inp
+            if inp is None:
+                print(f"  {i + 1:>2}. {entry['tool_name'][:16]:18} input not found")
+                continue
+            text = expand_tokens(expr, i, entry) if expr else None
+            try:
+                inp.SetExpression(text)
+                ok_count += 1
+            except Exception as e:
+                print(f"  {i + 1:>2}. {entry['tool_name'][:16]:18} failed: {e}")
+                continue
+            print(f"  {i + 1:>2}. {entry['clip'][:26]:28} "
+                  f"{entry['tool_name'][:16]:18} = {text if text else '(cleared)'}")
+        self.remember_param(param)
+        nudge_playhead()
+        self.refresh_values()
+        self.say(f"{label}: {ok_count} of {len(rows)} node(s) updated."
+                 + ("  Expression drives the whole point, not just this axis."
+                    if param["axis"] is not None and expr else ""))
+
+    def do_expression(self):
+        expr = self.expr_var.get().strip()
+        if not expr:
+            self.say("Type an expression first, or press Clear to remove one.", True)
+            return
+        self._write_expression(expr, "Set expression")
+
+    def clear_expression(self):
+        self._write_expression(None, "Clear expression")
 
     def _on_close(self):
         try:
