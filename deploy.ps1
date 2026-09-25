@@ -83,3 +83,53 @@ if ($jsxScripts.Count -gt 0) {
         }
     }
 }
+
+# --- Deploy .js scripts to Cavalry ---
+# Cavalry creates its Scripts folder on demand, and the user-content root is
+# Roaming (Palettes, Third-Party live there) while Local holds preferences.
+# Probe both so this is self-correcting; Help > Show Scripts Folder is the
+# authority if it ever picks wrong.
+$allJs = Get-ChildItem -Path $source -Recurse -Filter "*.js"
+# Anything under a "core" folder is shared library code, not a menu entry. It
+# goes to %APPDATA%\motion_link instead, because every .js in Cavalry's Scripts
+# folder shows up under Window > Scripts whether it is runnable or not.
+$coreJs = $allJs | Where-Object { $_.FullName -match '\\core\\' }
+$jsScripts = $allJs | Where-Object { $_.FullName -notmatch '\\core\\' }
+
+if ($coreJs.Count -gt 0) {
+    $mlInbox = "$env:APPDATA\motion_link"
+    if (-not (Test-Path $mlInbox)) { New-Item -ItemType Directory -Path $mlInbox -Force | Out-Null }
+    foreach ($file in $coreJs) {
+        Copy-Item -Path $file.FullName -Destination (Join-Path $mlInbox $file.Name) -Force
+        Write-Host "Deployed shared core: $($file.Name) -> $mlInbox"
+    }
+}
+
+if ($jsScripts.Count -gt 0) {
+    $cavRoot = @("$env:APPDATA\Cavalry", "$env:LOCALAPPDATA\Cavalry") |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $cavRoot) {
+        Write-Host "`nNo Cavalry data folder found - skipped .js deployment."
+    } else {
+        # A subfolder, so both scripts group under one Window > Scripts submenu
+        # instead of cluttering its root.
+        $cavScripts = Join-Path $cavRoot "Scripts\John"
+        if (-not (Test-Path $cavScripts)) {
+            New-Item -ItemType Directory -Path $cavScripts -Force | Out-Null
+            Write-Host "`nCreated Cavalry scripts folder: $cavScripts"
+        } else {
+            # Mirror the repo, same reasoning as the .py leg: a renamed script
+            # would otherwise linger as a duplicate menu entry.
+            $staleJs = Get-ChildItem -Path $cavScripts -Recurse -Filter "*.js" -ErrorAction SilentlyContinue
+            foreach ($old in $staleJs) { Remove-Item $old.FullName -Force }
+        }
+        $jsCopied = 0
+        foreach ($file in $jsScripts) {
+            Copy-Item -Path $file.FullName -Destination (Join-Path $cavScripts $file.Name) -Force
+            Write-Host "Deployed to Cavalry: $($file.Name)"
+            $jsCopied++
+        }
+        Write-Host "$jsCopied .js script(s) deployed to:"
+        Write-Host "  $cavScripts"
+    }
+}
