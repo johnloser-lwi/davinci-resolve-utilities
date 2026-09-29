@@ -5,8 +5,13 @@ from tkinter import messagebox
 
 # Reports how many of the current timeline's markers already have supporting
 # work built for them. Video track 1 (or whichever track(s) you tick as the
-# base/raw-footage track) is ignored; a marker counts as "done" if ANY clip on
-# any other video track overlaps its range, even partially. Audio is ignored.
+# base/raw-footage track) is ignored; a marker counts as "done" when clips on
+# the other video tracks cover at least a set percentage of its range (50% by
+# default). Audio is ignored.
+#
+# Coverage is measured as a UNION, not a sum: two clips that overlap each other
+# inside the marker are not counted twice, so the percentage is the share of the
+# marker's frames that actually have something on them.
 #
 # Only the marker colors actually present on the timeline are offered as
 # filters, so you can report on just the colors you care about.
@@ -64,11 +69,13 @@ def frame_to_tc(frame, fps, drop_frame):
     return f"{h:02d}:{mnt:02d}:{s:02d}{sep}{f:02d}"
 
 
-def ask_options(track_labels, color_counts, default_ignored, default_excluded):
-    """Tracks to ignore + marker colors to include. Colors listed are only
-    those actually present on the timeline. Returns (ignored, included)
-    or (None, None) if cancelled."""
-    result = [None, None]
+def ask_options(track_labels, color_counts, default_ignored, default_excluded,
+                default_threshold):
+    """Tracks to ignore, marker colors to include, and how much of a marker has
+    to be covered before it counts as done. Colors listed are only those
+    actually present on the timeline. Returns (ignored, included, threshold_pct)
+    or (None, None, None) if cancelled."""
+    result = [None, None, None]
 
     root = tk.Tk()
     root.title("Marker Progress")
@@ -124,9 +131,30 @@ def ask_options(track_labels, color_counts, default_ignored, default_excluded):
     tk.Button(toggles, text="All", width=5, command=lambda: set_all_colors(True)).pack(side="left")
     tk.Button(toggles, text="None", width=5, command=lambda: set_all_colors(False)).pack(side="left", padx=4)
 
+    # --- How much coverage counts as done ---
+    thresh_row = tk.Frame(root, bg=BG)
+    thresh_row.pack(fill="x", padx=14, pady=(10, 0))
+    tk.Label(thresh_row, text="Done when clips cover at least", bg=BG, fg=FG,
+             font=("Segoe UI", 9)).pack(side="left")
+    thresh_var = tk.StringVar(value=str(default_threshold))
+    tk.Spinbox(thresh_row, from_=1, to=100, increment=5, width=4,
+               textvariable=thresh_var, justify="center", bg=PANEL, fg=FG,
+               buttonbackground=PANEL, relief="flat", insertbackground=FG,
+               font=("Segoe UI", 9)).pack(side="left", padx=6)
+    tk.Label(thresh_row, text="% of the marker", bg=BG, fg=FG,
+             font=("Segoe UI", 9)).pack(side="left")
+    tk.Label(root, text="Stops a clip that clips the edge of a marker by a frame "
+                        "or two from counting as work.",
+             bg=BG, fg=SUB, font=("Segoe UI", 8), anchor="w",
+             justify="left").pack(fill="x", padx=14, pady=(2, 0))
+
     def on_ok():
         result[0] = [idx for idx, var in track_vars.items() if var.get()]
         result[1] = [c for c, var in color_vars.items() if var.get()]
+        try:
+            result[2] = min(100, max(1, int(float(thresh_var.get()))))
+        except ValueError:
+            result[2] = default_threshold
         root.destroy()
 
     btns = tk.Frame(root, bg=BG)
@@ -138,7 +166,7 @@ def ask_options(track_labels, color_counts, default_ignored, default_excluded):
     root.attributes("-topmost", True)
     root.mainloop()
 
-    return result[0], result[1]
+    return result[0], result[1], result[2]
 
 
 def show_report(timeline_name, subtitle, total, completed, lines):
@@ -247,10 +275,11 @@ else:
             track_labels.append((idx, label))
 
         prefs = load_prefs()
-        ignored, included = ask_options(
+        ignored, included, threshold_pct = ask_options(
             track_labels, color_counts,
             prefs.get("ignore_tracks", [1]),
             prefs.get("excluded_colors", []),
+            prefs.get("coverage_threshold", 50),
         )
 
         if ignored is None:
@@ -265,8 +294,10 @@ else:
                 **prefs,
                 "ignore_tracks": ignored,
                 "excluded_colors": sorted(set(newly_excluded) | set(remembered)),
+                "coverage_threshold": threshold_pct,
             })
 
+            threshold = threshold_pct / 100.0
             checked_tracks = [i for i in range(1, track_count + 1) if i not in ignored]
 
             # Collect clip ranges from the tracks that count as "work done"
@@ -275,11 +306,37 @@ else:
                 for item in timeline.GetItemListInTrack("video", idx) or []:
                     clip_ranges.append((item.GetStart(), item.GetEnd()))
 
-            def has_coverage(m_start, m_end):
+            def coverage_fraction(m_start, m_end):
+                """How much of [m_start, m_end) has a clip on it, as 0.0-1.0.
+
+                The overlapping pieces are merged before measuring. Summing them
+                instead would let two clips that overlap each other report more
+                coverage than the marker actually has - easily over 100%.
+                """
+                span = m_end - m_start
+                if span <= 0:
+                    return 0.0
+
+                pieces = []
                 for c_start, c_end in clip_ranges:
-                    if not (c_end <= m_start or c_start >= m_end):
-                        return True
-                return False
+                    lo = max(c_start, m_start)
+                    hi = min(c_end, m_end)
+                    if hi > lo:
+                        pieces.append((lo, hi))
+                if not pieces:
+                    return 0.0
+
+                pieces.sort()
+                covered = 0
+                run_start, run_end = pieces[0]
+                for lo, hi in pieces[1:]:
+                    if lo > run_end:            # gap: bank the run, start a new one
+                        covered += run_end - run_start
+                        run_start, run_end = lo, hi
+                    elif hi > run_end:          # overlaps or touches: extend it
+                        run_end = hi
+                covered += run_end - run_start
+                return covered / float(span)
 
             fps = timeline.GetSetting("timelineFrameRate") or 24
             drop_frame = str(timeline.GetSetting("timelineDropFrameTimecode") or "0") == "1"
@@ -297,7 +354,8 @@ else:
                 # GetStart()/GetEnd() are absolute — line them up before comparing.
                 abs_start = start_frame + int(rel_frame)
                 abs_end = abs_start + max(int(data.get("duration") or 1), 1)
-                if has_coverage(abs_start, abs_end):
+                covered = coverage_fraction(abs_start, abs_end)
+                if covered >= threshold:
                     completed += 1
                 else:
                     not_done.append({
@@ -305,6 +363,7 @@ else:
                         "name": (data.get("name") or "").strip(),
                         "color": color,
                         "note": (data.get("note") or "").replace("\n", " ").strip(),
+                        "covered": covered,
                     })
 
             lines = []
@@ -312,12 +371,17 @@ else:
                 tc = frame_to_tc(m["abs_start"], fps, drop_frame)
                 label = m["name"] or "(unnamed)"
                 color = f"[{m['color']}]".ljust(11)
-                line = f"{tc}  {color} {label}"
+                # Show how far off each one is: a marker sitting at 45% is a
+                # different job from one at 0%, and that distinction is the
+                # whole point of measuring coverage rather than just overlap.
+                pct = f"{m['covered'] * 100:3.0f}%"
+                line = f"{tc}  {pct}  {color} {label}"
                 if m["note"]:
                     line += f" :: {m['note']}"
                 lines.append(line)
 
-            subtitle = "Ignoring " + (", ".join(f"V{i}" for i in sorted(ignored)) or "nothing")
+            subtitle = (f"Done at {threshold_pct}%+ coverage   ·   Ignoring "
+                        + (", ".join(f"V{i}" for i in sorted(ignored)) or "nothing"))
             if len(included) < len(color_counts):
                 subtitle += "   ·   " + ", ".join(sorted(included)) + " markers only"
             if not checked_tracks:
