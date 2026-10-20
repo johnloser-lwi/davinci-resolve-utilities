@@ -55,6 +55,25 @@ foreach ($file in $scripts) {
 Write-Host "`nDone. $copied script(s) deployed to:"
 Write-Host "  $dest"
 
+# --- Data files that sit beside a script ---
+# The Fusion Clipboard's Studio-safe conversion rules are data, not code, so
+# they would otherwise never reach Resolve's scripts folder.
+# Only JSON that sits in a script folder - never dot-folders like .claude or
+# .git, and never build output.
+$dataFiles = Get-ChildItem -Path $source -Recurse -Filter "*.json" |
+    Where-Object { $_.FullName -notmatch '\\\.[^\\]+\\' -and
+                   $_.FullName -notmatch '\\(build|dist)\\' }
+foreach ($file in $dataFiles) {
+    $relative  = $file.FullName.Substring($source.Length).TrimStart('\')
+    $target    = Join-Path $dest $relative
+    $targetDir = Split-Path $target -Parent
+    if (-not (Test-Path $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
+    Copy-Item -Path $file.FullName -Destination $target -Force
+    Write-Host "Deployed data: $relative"
+}
+
 # --- Deploy .jsx scripts to After Effects (newest version found) ---
 $jsxScripts = Get-ChildItem -Path $source -Recurse -Filter "*.jsx"
 if ($jsxScripts.Count -gt 0) {

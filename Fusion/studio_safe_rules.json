@@ -1,0 +1,87 @@
+{
+  "_README": [
+    "Conversion rules for 'Copy Studio-safe' in the Fusion Clipboard panel.",
+    "",
+    "ResolveFX ship with DaVinci Resolve and do NOT exist in Fusion Studio, so a",
+    "preset using them comes up with missing tools there. These rules rewrite",
+    "them into native Fusion tools. Third-party OFX and Fuses are deliberately",
+    "left alone - install those in Studio and they resolve fine.",
+    "",
+    "ANYTHING IN <<ANGLE BRACKETS>> IS UNVERIFIED AND BLOCKS THE RULE FROM",
+    "RUNNING. That is on purpose. A wrong target input name cannot be detected",
+    "from the text - Fusion silently accepts unknown inputs and pastes the node",
+    "at its defaults - so the only defence is capturing the real names first.",
+    "",
+    "To fill them in: in Fusion, add the native tool, move EVERY control off its",
+    "default (Fusion only writes out non-default inputs), Ctrl+C, then click",
+    "'Learn Node' in the panel. Replace each <<placeholder>> with what the report",
+    "shows. Then calibrate the numbers by eye: build the ResolveFX node and the",
+    "converted native one side by side in Resolve and A/B them.",
+    "",
+    "Transforms are named and implemented in Python, never expressions, so this",
+    "file can never execute code.",
+    "  passthrough  - copy the value across",
+    "  linear       - value * mul + add, optional clamp [low, high]",
+    "  polar_to_xy  - angle + distance -> x, y. Calibrate angle_zero_deg,",
+    "                 angle_sign (+1 CCW / -1 CW) and distance_mul by MEASURING:",
+    "                 set the angle to 0, then 90, and watch which way it moves.",
+    "                 emit: 'two_scalars' or 'point' ({ x, y })."
+  ],
+
+  "schema_version": 1,
+
+  "rules": [
+    {
+      "id": "dropshadow_to_shadow",
+      "source": "ofx.com.blackmagicdesign.resolvefx.DropShadow",
+      "target": "<<Shadow>>",
+      "notes": "7 of these across 6 of your presets - the only ResolveFX node in your library.",
+      "image_input": { "from": "Source", "to": "<<Input>>" },
+      "params": [
+        {
+          "from": ["shadowStrength"],
+          "to": ["<<ShadowStrength>>"],
+          "transform": "linear", "mul": 1.0, "add": 0.0
+        },
+        {
+          "from": ["shadowBlur"],
+          "to": ["<<ShadowBlur>>"],
+          "transform": "linear", "mul": 1.0, "add": 0.0,
+          "notes": "ResolveFX 0.55 and native blur units almost certainly differ - calibrate mul."
+        },
+        {
+          "from": ["shadowAngle", "ShadowDistance"],
+          "to": ["<<ShadowOffsetX>>", "<<ShadowOffsetY>>"],
+          "transform": "polar_to_xy",
+          "angle_zero_deg": 0.0,
+          "angle_sign": 1,
+          "distance_mul": 1.0,
+          "origin": [0.0, 0.0],
+          "emit": "two_scalars",
+          "notes": "If native Shadow takes one point instead of two scalars, set emit to 'point' and give a single target."
+        },
+        { "from": ["shadowColorRed"],   "to": ["<<ShadowColorRed>>"],   "transform": "passthrough" },
+        { "from": ["shadowColorGreen"], "to": ["<<ShadowColorGreen>>"], "transform": "passthrough" },
+        { "from": ["shadowColorBlue"],  "to": ["<<ShadowColorBlue>>"],  "transform": "passthrough" }
+      ]
+    },
+
+    {
+      "id": "resolvefx_blur_to_blur",
+      "source": "<<ofx.com.blackmagicdesign.resolvefx.SOMETHING>>",
+      "target": "Blur",
+      "notes": "The native side is already known from your own Animations/Fade Rotate Blur preset, which Fusion itself wrote: image input 'Input', size 'XBlurSize', and an explicit Filter. The ResolveFX side is unknown - no ResolveFX blur exists anywhere in your library, so Learn Node one in Resolve to get its RegID and input names.",
+      "image_input": { "from": "Source", "to": "Input" },
+      "params": [
+        {
+          "from": ["<<blurAmount>>"],
+          "to": ["XBlurSize"],
+          "transform": "linear", "mul": 1.0, "add": 0.0
+        }
+      ],
+      "defaults": [
+        { "to": "Filter", "literal": "FuID { \"Fast Gaussian\" }" }
+      ]
+    }
+  ]
+}

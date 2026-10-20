@@ -1,7 +1,10 @@
 import ctypes
 import json
+import math
 import os
+import re
 import shutil
+import sys
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox, ttk
@@ -18,12 +21,33 @@ for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
     except Exception:
         continue
 
-# Fusion Clipboard — a node preset manager.
+# Fusion Clipboard — a clipboard manager for Fusion nodes.
 #
-# Save the currently selected Fusion nodes under a name, organize them into
-# folders with notes and favorites, then paste them back into any comp.
-# Presets are plain .setting files on disk (browsable in Explorer) with a
-# small .json sidecar holding notes / tool types / favorite flag.
+# It never touches the comp. Copy nodes in Fusion with Ctrl+C, click Save, and
+# whatever Fusion put on the system clipboard is written to a file verbatim.
+# Click Copy on a saved preset and that text goes straight back on the
+# clipboard, ready for Ctrl+V in Fusion.
+#
+# WHY NOT AUTOMATE THE PASTE
+#   An earlier version used comp.CopySettings() / comp.Paste(). That round trip
+#   silently drops things — most visibly the user controls on a Group, which
+#   come back bare. Fusion's own Ctrl+C blob carries them, so the fix is to stop
+#   re-serialising it and just move the exact bytes around. Being a dumber tool
+#   makes it a more faithful one.
+#
+# Revising a template: select it and hit Update from Clipboard. Name, folder,
+# notes and favorite stay put, only the contents change. The previous version is
+# kept beside it as a .setting.bak.
+#
+# RUNS STANDALONE
+#   Because it never talks to Resolve or Fusion, this is just a Python/tkinter
+#   app. Resolve's Scripts menu runs the deployed copy; "Fusion Clipboard.cmd"
+#   in the repo root runs this one directly. Same file either way - there is no
+#   second copy to keep in step.
+#
+# Presets are plain .setting files (browsable in Explorer, and still valid for
+# Fusion's own Paste Setting) with a small .json sidecar holding notes / node
+# types / favorite flag.
 
 PREFS_FILE = os.path.expandvars(r"%APPDATA%\fusion_clipboard_prefs.json")
 # Presets live next to the prefs files, same as the other scripts. Set
@@ -129,6 +153,16 @@ def meta_path(setting_path):
     return os.path.splitext(setting_path)[0] + ".json"
 
 
+def backup_path(setting_path):
+    """Previous contents, kept by Update from Clipboard."""
+    return setting_path + ".bak"
+
+
+def companion_paths(setting_path):
+    """The files that travel with a preset: its sidecar and its backup."""
+    return [meta_path(setting_path), backup_path(setting_path)]
+
+
 def read_meta(setting_path):
     path = meta_path(setting_path)
     if os.path.exists(path):
@@ -149,104 +183,609 @@ def write_meta(setting_path, meta):
 
 
 # --------------------------------------------------------------------------
-# Fusion bridge — every call re-fetches the comp so we follow the active one
+# Windows clipboard
+#
+# The Win32 API is used rather than Tk's clipboard_append, because Tk only
+# OWNS the clipboard while the app is alive — close this panel and the content
+# it put there evaporates before you get to Ctrl+V. SetClipboardData hands the
+# data to the system, so it survives.
 # --------------------------------------------------------------------------
 
-resolve = bmd.scriptapp("Resolve")
-fusion = resolve.Fusion()
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+# Handles and pointers are 64-bit; without these the return values get
+# truncated to 32 bits and the calls fail in ways that look like "empty
+# clipboard" rather than an error.
+_user32.GetClipboardData.restype = ctypes.c_void_p
+_user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+_user32.SetClipboardData.restype = ctypes.c_void_p
+_kernel32.GlobalAlloc.restype = ctypes.c_void_p
+_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalLock.restype = ctypes.c_void_p
+_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+_kernel32.GlobalFree.restype = ctypes.c_void_p
 
 
-def current_comp():
+def _open_clipboard(attempts=10):
+    """Another app can hold the clipboard open for a moment — retry briefly."""
+    import time
+    for _ in range(attempts):
+        if _user32.OpenClipboard(0):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def get_clipboard_text():
+    """Whatever text is on the clipboard. Returns (text, error)."""
+    if not _open_clipboard():
+        return None, "another application is holding the clipboard"
     try:
-        return fusion.GetCurrentComp()
-    except Exception:
-        return None
-
-
-def selected_tools(comp):
-    try:
-        return comp.GetToolList(True) or {}
-    except Exception:
-        return {}
-
-
-def tool_types(tools):
-    types = []
-    for tool in tools.values():
+        handle = _user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None, "the clipboard has no text on it"
+        ptr = _kernel32.GlobalLock(handle)
+        if not ptr:
+            return None, "could not read the clipboard data"
         try:
-            types.append(tool.GetAttrs()["TOOLS_RegID"])
-        except Exception:
-            types.append("?")
-    return types
-
-
-def copy_settings(comp):
-    """Serialize the current selection. Returns (settings, error)."""
-    try:
-        settings = comp.CopySettings()
-        if settings:
-            return settings, None
+            return ctypes.c_wchar_p(ptr).value, None
+        finally:
+            _kernel32.GlobalUnlock(handle)
     except Exception as e:
-        first_err = str(e)
-    else:
-        first_err = "CopySettings() returned nothing"
+        return None, str(e)
+    finally:
+        _user32.CloseClipboard()
 
-    # Some builds want the tool passed explicitly
-    sel = selected_tools(comp)
-    if len(sel) == 1:
+
+def set_clipboard_text(text):
+    """Put text on the clipboard for real. Returns (ok, error)."""
+    buffer = ctypes.create_unicode_buffer(text)
+    size = ctypes.sizeof(buffer)
+    handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+    if not handle:
+        return False, "could not allocate clipboard memory"
+    ptr = _kernel32.GlobalLock(handle)
+    if not ptr:
+        _kernel32.GlobalFree(handle)
+        return False, "could not lock clipboard memory"
+    ctypes.memmove(ptr, buffer, size)
+    _kernel32.GlobalUnlock(handle)
+
+    if not _open_clipboard():
+        _kernel32.GlobalFree(handle)
+        return False, "another application is holding the clipboard"
+    try:
+        _user32.EmptyClipboard()
+        if not _user32.SetClipboardData(CF_UNICODETEXT, handle):
+            # Ownership only transfers on success, so on failure the block is
+            # still ours to release.
+            _kernel32.GlobalFree(handle)
+            return False, "the system refused the clipboard data"
+        return True, None
+    finally:
+        _user32.CloseClipboard()
+
+
+# --------------------------------------------------------------------------
+# reading Fusion's clipboard blob
+# --------------------------------------------------------------------------
+
+def looks_like_fusion_nodes(text):
+    head = (text or "").lstrip()[:400]
+    return head.startswith("{") and "Tools" in head
+
+
+def parse_tool_types(text):
+    """Node types out of a Fusion clipboard blob, in order."""
+    return [block["type"] for block in scan_blocks(text)]
+
+
+# --------------------------------------------------------------------------
+# the blob scanner
+#
+# A Fusion clipboard blob nests as
+#     { Tools = ordered() { Name = ToolType { Inputs = { ... } } } }
+# so the nodes are the entries at brace depth 2.
+#
+# This walks CHARACTERS, not lines, and records index ranges. Two reasons:
+#
+#   - Rewriting a node needs exact offsets. A line scanner has none, and a node's
+#     inputs are often all on one line.
+#   - Counting "{" minus "}" per line has no idea what a string is. Braces inside
+#     a Text+'s StyledText balance out by luck; ONE unbalanced brace in a title
+#     ("50% off {") shifts the depth for the rest of the file and the scanner
+#     starts treating nested entries as nodes. Ignoring braces inside strings
+#     makes both cases moot.
+# --------------------------------------------------------------------------
+
+BLOCK_HEADER = re.compile(r"([A-Za-z_]\w*)\s*=\s*([A-Za-z_][\w.]*)\s*$")
+#                                                        ^^^^^^^ dots matter:
+# without them "ofx.com.blackmagicdesign.resolvefx.DropShadow" and
+# "Fuse.Duplicate" never match, and every plugin node goes silently missing.
+
+
+def _skip_string(text, i):
+    """Index just past the string literal that starts at text[i]."""
+    quote = text[i]
+    i += 1
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == quote:
+            return i + 1
+        i += 1
+    return i                      # unterminated: treat the rest as string
+
+
+def _matching_brace(text, open_index):
+    """Index of the '}' closing the '{' at open_index, string-aware."""
+    depth = 0
+    i = open_index
+    while i < len(text):
+        c = text[i]
+        if c in '"\'':
+            i = _skip_string(text, i)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _find_inputs_span(text, block_open, block_close):
+    """(start, end) of the body of this block's own `Inputs = { ... }`.
+
+    Only the block's immediate children are considered, so an `Inputs` belonging
+    to a nested tool inside a Group is never mistaken for this one.
+    """
+    depth = 0
+    i = block_open
+    while i < block_close:
+        c = text[i]
+        if c in '"\'':
+            i = _skip_string(text, i)
+            continue
+        if c == "{":
+            depth += 1
+            if depth == 2:
+                header = text[max(0, i - 80):i]
+                match = re.search(r"Inputs\s*=\s*(?:ordered\(\)\s*)?$", header)
+                if match:
+                    close = _matching_brace(text, i)
+                    if close != -1:
+                        return i + 1, close
+                close = _matching_brace(text, i)
+                i = close if close != -1 else i
+                depth -= 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    return None
+
+
+def scan_blocks(text):
+    """Every node at depth 2, with the index ranges needed to rewrite it.
+
+    Each record: name, type, type_span, block_span (the braces), inputs_span.
+    """
+    text = text or ""
+    blocks = []
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c in '"\'':
+            i = _skip_string(text, i)
+            continue
+        if c == "{":
+            # Depth 2 = inside the outer brace and inside Tools, which is where
+            # the nodes live. "Tools = ordered() {" never matches the header
+            # pattern (the parens), so it falls through and just adds depth.
+            if depth == 2:
+                # Look back over the "Name = Type" that introduces this brace.
+                header = text[max(0, i - 200):i]
+                match = BLOCK_HEADER.search(header.rstrip())
+                close = _matching_brace(text, i)
+                if match and close != -1:
+                    type_end = max(0, i - 200) + match.end(2)
+                    blocks.append({
+                        "name": match.group(1),
+                        "type": match.group(2),
+                        "type_span": (type_end - len(match.group(2)), type_end),
+                        "block_span": (i, close + 1),
+                        "inputs_span": _find_inputs_span(text, i, close),
+                    })
+                    i = close + 1          # skip the whole node
+                    continue
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    return blocks
+
+
+def split_entries(text, start, end):
+    """`key = value` pairs at the top level of a brace body.
+
+    Returns [{key, key_span, value, value_span}]. Nested braces and strings are
+    stepped over, so `Center = Input { Value = { 0.39, 0.34 } }` comes back as
+    one entry rather than three.
+    """
+    entries = []
+    i = start
+    while i < end:
+        c = text[i]
+        if c in '"\'':
+            i = _skip_string(text, i)
+            continue
+        if c.isspace() or c == ",":
+            i += 1
+            continue
+
+        key_match = re.compile(r"([A-Za-z_]\w*)\s*=\s*").match(text, i, end)
+        if not key_match:
+            i += 1
+            continue
+
+        value_start = key_match.end()
+        j = value_start
+        depth = 0
+        while j < end:
+            ch = text[j]
+            if ch in '"\'':
+                j = _skip_string(text, j)
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            j += 1
+
+        entries.append({
+            "key": key_match.group(1),
+            "key_span": (i, i + len(key_match.group(1))),
+            "value": text[value_start:j].rstrip(),
+            "value_span": (value_start, j),
+        })
+        i = j + 1
+    return entries
+
+
+# --------------------------------------------------------------------------
+# ResolveFX -> native Fusion conversion
+#
+# ResolveFX ship with Resolve and do NOT exist in Fusion Studio, so a preset
+# using them comes up with missing tools there. Third-party OFX and Fuses are
+# deliberately NOT touched or reported: install them in Studio and they resolve
+# fine, which is why this keys off one exact prefix instead of trying to tell
+# "native" from "not" (a Fuse like KD_Recolor is indistinguishable from a native
+# tool by its type token alone).
+# --------------------------------------------------------------------------
+
+RESOLVEFX_PREFIX = "ofx.com.blackmagicdesign.resolvefx."
+RULES_FILE = os.path.expandvars(r"%APPDATA%\fusion_clipboard_rules.json")
+PLACEHOLDER = re.compile(r"<<.*?>>")
+
+# Shipped defaults. Anything in <<angle brackets>> is a value nobody has
+# verified yet, and a rule containing one REFUSES to run - see rule_blocked().
+# That is deliberate: guessing at an undocumented schema has gone wrong on this
+# project three times, and a wrong input name here is undetectable from the text
+# because Fusion silently accepts unknown inputs and pastes the node at default.
+DEFAULT_RULES = {
+    "schema_version": 1,
+    "rules": [
+        {
+            "id": "dropshadow_to_shadow",
+            "source": RESOLVEFX_PREFIX + "DropShadow",
+            "target": "<<Shadow>>",
+            "notes": "Run Learn Node on a native Shadow (every control moved off "
+                     "its default) and replace every <<...>> from the report.",
+            "image_input": {"from": "Source", "to": "<<Input>>"},
+            "params": [
+                {"from": ["shadowStrength"], "to": ["<<ShadowStrength>>"],
+                 "transform": "linear", "mul": 1.0, "add": 0.0},
+                {"from": ["shadowBlur"], "to": ["<<ShadowBlur>>"],
+                 "transform": "linear", "mul": 1.0, "add": 0.0,
+                 "notes": "ResolveFX blur units almost certainly differ - calibrate mul."},
+                {"from": ["shadowAngle", "ShadowDistance"],
+                 "to": ["<<ShadowOffsetX>>", "<<ShadowOffsetY>>"],
+                 "transform": "polar_to_xy",
+                 "angle_zero_deg": 0.0, "angle_sign": 1, "distance_mul": 1.0,
+                 "origin": [0.0, 0.0], "emit": "two_scalars",
+                 "notes": "Angle convention and distance normalisation UNVERIFIED - "
+                          "measure by setting shadowAngle to 0 then 90 and watching."},
+                {"from": ["shadowColorRed"], "to": ["<<ShadowColorRed>>"],
+                 "transform": "passthrough"},
+                {"from": ["shadowColorGreen"], "to": ["<<ShadowColorGreen>>"],
+                 "transform": "passthrough"},
+                {"from": ["shadowColorBlue"], "to": ["<<ShadowColorBlue>>"],
+                 "transform": "passthrough"},
+            ],
+        },
+        {
+            "id": "resolvefx_blur_to_blur",
+            "source": "<<" + RESOLVEFX_PREFIX + "SOMETHING>>",
+            "target": "Blur",
+            "notes": "The native side is known from your own Animations/Fade Rotate "
+                     "Blur preset. The ResolveFX side is not - no ResolveFX blur "
+                     "exists in your library, so Learn Node one first.",
+            "image_input": {"from": "Source", "to": "Input"},
+            "params": [
+                {"from": ["<<blurAmount>>"], "to": ["XBlurSize"],
+                 "transform": "linear", "mul": 1.0, "add": 0.0},
+            ],
+            "defaults": [{"to": "Filter", "literal": 'FuID { "Fast Gaussian" }'}],
+        },
+    ],
+}
+
+
+def resource_dir():
+    """Where a file shipped beside this script lives.
+
+    Three different answers, because this runs three ways: from Resolve's
+    Scripts folder, from the repo via the .cmd, and from inside a PyInstaller
+    bundle (where data is unpacked to _MEIPASS, not next to the .exe). __file__
+    is also absent in some embedded interpreters, hence the fallback.
+    """
+    bundled = getattr(sys, "_MEIPASS", None)
+    if bundled:
+        return bundled
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def load_rules():
+    """Shipped defaults, overlaid by a repo file, overlaid by a user file.
+
+    Later sources win per rule id. A broken file is reported rather than
+    crashing the panel - the verbatim copy path must keep working regardless.
+    """
+    merged = {r["id"]: r for r in DEFAULT_RULES["rules"]}
+    problems = []
+    for path in (os.path.join(resource_dir(), "studio_safe_rules.json"),
+                 RULES_FILE):
+        if not os.path.exists(path):
+            continue
         try:
-            settings = comp.CopySettings(list(sel.values())[0])
-            if settings:
-                return settings, None
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for rule in data.get("rules", []):
+                if rule.get("id"):
+                    merged[rule["id"]] = rule
         except Exception as e:
-            return None, f"{first_err}; per-tool: {e}"
-    return None, first_err
+            problems.append(f"{os.path.basename(path)}: {e}")
+    return list(merged.values()), problems
 
 
-def paste_settings(comp, settings):
-    """Paste a settings table into the comp. Returns (ok, how, errors)."""
-    errors = []
-    try:
-        comp.Lock()
-        comp.StartUndo("Paste Fusion Preset")
-    except Exception:
-        pass
+def rule_blocked(rule):
+    """The unverified bits of a rule, as a list of strings. Empty means usable."""
+    found = []
 
-    ok, how = False, ""
-    try:
-        ok = bool(comp.Paste(settings))
-        how = "Paste(table)"
-    except Exception as e:
-        errors.append(f"Paste(table): {e}")
+    def walk(node, path):
+        if isinstance(node, str):
+            if PLACEHOLDER.search(node):
+                found.append(f"{path} = {node}")
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                if k != "notes":
+                    walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(node, list):
+            for n, v in enumerate(node):
+                walk(v, f"{path}[{n}]")
 
-    if not ok:
-        # Fall back to routing it through Fusion's own clipboard
+    walk(rule, "")
+    return found
+
+
+def _number(value_text):
+    """The number out of an `Input { Value = 0.55 }` body, or None."""
+    match = re.search(r"\bValue\s*=\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", value_text or "")
+    return float(match.group(1)) if match else None
+
+
+def _is_connected(value_text):
+    return "SourceOp" in (value_text or "")
+
+
+def _fmt(value):
+    """A number as Fusion writes them - no scientific notation, no trailing junk."""
+    text = f"{float(value):.10g}"
+    return text
+
+
+def apply_transform(spec, values):
+    """Source numbers -> [(target_name, literal_text)]. Raises ValueError if the
+    mapping cannot be made honestly."""
+    kind = spec.get("transform", "passthrough")
+    targets = spec.get("to", [])
+
+    if kind in ("passthrough", "linear"):
+        if values[0] is None:
+            raise ValueError("source value missing")
+        out = values[0] * float(spec.get("mul", 1.0)) + float(spec.get("add", 0.0))
+        low, high = (spec.get("clamp") or [None, None])
+        if low is not None:
+            out = max(out, low)
+        if high is not None:
+            out = min(out, high)
+        return [(targets[0], _fmt(out))]
+
+    if kind == "polar_to_xy":
+        angle, distance = values[0], values[1]
+        if angle is None or distance is None:
+            raise ValueError("angle or distance missing")
+        theta = math.radians(angle * float(spec.get("angle_sign", 1))
+                             + float(spec.get("angle_zero_deg", 0.0)))
+        reach = distance * float(spec.get("distance_mul", 1.0))
+        origin = spec.get("origin") or [0.0, 0.0]
+        x = origin[0] + reach * math.cos(theta)
+        y = origin[1] + reach * math.sin(theta)
+        if spec.get("emit") == "point":
+            return [(targets[0], "{ %s, %s }" % (_fmt(x), _fmt(y)))]
+        return [(targets[0], _fmt(x)), (targets[1], _fmt(y))]
+
+    raise ValueError(f"unknown transform '{kind}'")
+
+
+def convert_blob(text, rules):
+    """Rewrite ResolveFX nodes into native equivalents.
+
+    Returns (new_text, report). The report always lists what was converted, what
+    was left alone and why; the caller decides whether that is acceptable.
+    """
+    report = {"converted": [], "skipped": [], "nested": 0, "blocked": []}
+    by_source = {r.get("source"): r for r in rules}
+
+    blocks = [b for b in scan_blocks(text) if b["type"].startswith(RESOLVEFX_PREFIX)]
+
+    # A ResolveFX node nested inside a Group is never a depth-2 block, so it is
+    # never edited. Counting raw occurrences is how we notice and say so rather
+    # than claiming a clean conversion.
+    report["nested"] = max(0, text.count(RESOLVEFX_PREFIX) - len(blocks))
+
+    edits = []
+    for block in blocks:
+        rule = by_source.get(block["type"])
+        if not rule:
+            report["skipped"].append((block["name"], block["type"], "no rule"))
+            continue
+        missing = rule_blocked(rule)
+        if missing:
+            report["blocked"].append((block["name"], rule.get("id"), missing))
+            continue
         try:
-            bmd.setclipboard(settings)
-            ok = bool(comp.Paste())
-            how = "clipboard + Paste()"
-        except Exception as e:
-            errors.append(f"clipboard: {e}")
+            new_inputs = build_inputs(text, block, rule)
+        except ValueError as e:
+            report["skipped"].append((block["name"], block["type"], str(e)))
+            continue
+        edits.append((block, rule, new_inputs))
+        report["converted"].append((block["name"], block["type"], rule["target"]))
 
-    try:
-        comp.EndUndo(True)
-        comp.Unlock()
-    except Exception:
-        pass
-    return ok, how, errors
+    # Splice right-to-left so earlier offsets stay valid.
+    out = text
+    for block, rule, new_inputs in sorted(edits, key=lambda e: -e[0]["block_span"][0]):
+        if block["inputs_span"]:
+            i0, i1 = block["inputs_span"]
+            out = out[:i0] + new_inputs + out[i1:]
+        t0, t1 = block["type_span"]
+        out = out[:t0] + rule["target"] + out[t1:]
+
+    return out, report
+
+
+def build_inputs(text, block, rule):
+    """The replacement body for a node's `Inputs = { ... }`."""
+    if not block["inputs_span"]:
+        raise ValueError("node has no Inputs block")
+    i0, i1 = block["inputs_span"]
+    entries = {e["key"]: e for e in split_entries(text, i0, i1)}
+
+    body = text[i0:i1]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    indent_match = re.search(r"(?:\r?\n)([ \t]+)", body)
+    indent = indent_match.group(1) if indent_match else "\t\t\t\t"
+    closing = indent[:-1] if len(indent) > 1 else indent
+
+    lines = []
+
+    # The image connection, carried across verbatim apart from its key. This is
+    # what keeps the node wired to its upstream; the node's own name is never in
+    # an edited span, so references TO it survive automatically.
+    image = rule.get("image_input") or {}
+    source_entry = entries.get(image.get("from"))
+    if source_entry is not None:
+        lines.append(f"{indent}{image.get('to')} = {source_entry['value']},")
+
+    for spec in rule.get("params", []):
+        values = []
+        for key in spec.get("from", []):
+            entry = entries.get(key)
+            if entry is None:
+                values.append(None)
+                continue
+            if _is_connected(entry["value"]):
+                # An animated or connected input cannot be run through the
+                # maths - two animated polar inputs do not become two animated
+                # cartesian ones without resampling the splines. Refuse.
+                raise ValueError(f"'{key}' is animated or connected")
+            values.append(_number(entry["value"]))
+        if all(v is None for v in values):
+            continue                      # absent on the source = left at default
+        for target, literal in apply_transform(spec, values):
+            lines.append(f"{indent}{target} = Input {{ Value = {literal}, }},")
+
+    for default in rule.get("defaults", []):
+        lines.append(f"{indent}{default['to']} = Input {{ Value = {default['literal']}, }},")
+
+    if not lines:
+        raise ValueError("nothing mapped")
+    return newline + newline.join(lines) + newline + closing
+
+
+def validate_conversion(original, converted):
+    """Problems with a rewritten blob. Empty list means it is safe to use."""
+    problems = []
+
+    before = scan_blocks(original)
+    after = scan_blocks(converted)
+    if [b["name"] for b in before] != [b["name"] for b in after]:
+        problems.append("node names or their order changed")
+
+    if any(b["type"].startswith(RESOLVEFX_PREFIX) for b in after
+           if b["name"] in {x["name"] for x in before
+                            if x["type"].startswith(RESOLVEFX_PREFIX)}
+           and b["type"] != next(x["type"] for x in before if x["name"] == b["name"])):
+        problems.append("a converted node still carries the ResolveFX prefix")
+
+    names = {b["name"] for b in after}
+    refs_before = set(re.findall(r'SourceOp\s*=\s*"([^"]+)"', original))
+    refs_after = set(re.findall(r'SourceOp\s*=\s*"([^"]+)"', converted))
+    if refs_before != refs_after:
+        problems.append("a node connection was changed or lost")
+    for ref in refs_after:
+        if ref not in names and ref in {b["name"] for b in before}:
+            problems.append(f"connection to '{ref}' no longer resolves")
+            break
+
+    return problems
 
 
 def read_setting_file(path):
+    # newline="" on both read and write, so the CRLFs Fusion puts on the
+    # clipboard survive the round trip untranslated. Python's default universal
+    # newline handling would quietly turn them into \n on the way back out,
+    # which defeats the point of storing the blob verbatim.
     try:
-        return bmd.readfile(path), None
-    except Exception as e:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            return f.read(), None
+    except OSError as e:
         return None, str(e)
 
 
-def write_setting_file(path, settings):
+def write_setting_file(path, text):
     try:
-        return bool(bmd.writefile(path, settings)), None
-    except Exception as e:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return True, None
+    except OSError as e:
         return False, str(e)
 
 
@@ -453,7 +992,7 @@ class FusionClipboard:
         self.search_entry = search
         tk.Label(top, text="Search  (Ctrl+F)", bg=BG, fg=SUB,
                  font=FONT(8)).pack(side="left", padx=(0, S(12)))
-        make_button(top, "+  Save Selection", self.save_selection, primary=True).pack(side="right")
+        make_button(top, "+  Save Clipboard", self.save_selection, primary=True).pack(side="right")
 
         middle = tk.Frame(self.root, bg=BG)
         middle.pack(fill="both", expand=True, padx=S(12))
@@ -511,13 +1050,20 @@ class FusionClipboard:
         # actions
         actions = tk.Frame(self.root, bg=BG)
         actions.pack(fill="x", padx=S(12), pady=(S(10), S(4)))
-        make_button(actions, "Paste into Comp", self.paste, primary=True).pack(side="left")
+        make_button(actions, "Copy to Clipboard", self.paste, primary=True).pack(side="left")
+        # Not primary: the verbatim copy stays the default, Studio-safe is the
+        # occasional path.
+        make_button(actions, "Copy Studio-safe",
+                    self.paste_studio_safe).pack(side="left", padx=S(6))
+        make_button(actions, "Update from Clipboard",
+                    self.update_from_clipboard).pack(side="left", padx=S(6))
         self.fav_btn = make_button(actions, "☆ Favorite", self.toggle_favorite)
         self.fav_btn.pack(side="left", padx=S(6))
         make_button(actions, "Rename", self.rename).pack(side="left", padx=(0, S(6)))
         make_button(actions, "Move", self.move).pack(side="left", padx=(0, S(6)))
         make_button(actions, "Delete", self.delete).pack(side="left")
         make_button(actions, "⟳", self.refresh).pack(side="right")
+        make_button(actions, "Learn Node", self.learn_node).pack(side="right", padx=S(6))
         make_button(actions, "Open Folder", self.open_folder).pack(side="right", padx=S(6))
         make_button(actions, "New Folder", self.new_folder).pack(side="right")
 
@@ -655,6 +1201,8 @@ class FusionClipboard:
             bits.append(f"Folder:  {preset['folder']}")
         if meta.get("created"):
             bits.append(f"Saved:  {meta['created']}")
+        if meta.get("updated"):
+            bits.append(f"Updated:  {meta['updated']}")
         self.detail_meta.config(text="\n".join(bits))
         self.notes.delete("1.0", "end")
         self.notes.insert("1.0", meta.get("notes", ""))
@@ -663,24 +1211,31 @@ class FusionClipboard:
 
     # -- actions ----------------------------------------------------------
     def save_selection(self):
-        comp = current_comp()
-        if not comp:
-            self.say("No Fusion comp open — open a clip on the Fusion page first.", True)
-            return
-        sel = selected_tools(comp)
-        if not sel:
-            self.say("Nothing selected in the comp — select the node(s) to save.", True)
+        text, err = get_clipboard_text()
+        if not text:
+            self.say(f"Nothing to save — {err}. Select your nodes in Fusion and "
+                     f"press Ctrl+C first.", True)
             return
 
-        types = tool_types(sel)
+        if not looks_like_fusion_nodes(text):
+            preview = text.strip().replace("\n", " ")[:60]
+            if not messagebox.askyesno(
+                    "Fusion Clipboard",
+                    "The clipboard doesn't look like Fusion nodes:\n\n"
+                    f"  {preview}...\n\nSave it anyway?",
+                    parent=self.root):
+                return
+
+        types = parse_tool_types(text)
         sel_node = self.tree.selection()
         default_folder = ""
         if sel_node and sel_node[0] not in (ALL_NODE, FAV_NODE, RECENT_NODE):
             default_folder = sel_node[0]
 
+        summary = f"{len(types)} node(s): {' + '.join(types)}" if types else "clipboard text"
         dlg = PromptDialog(
-            self.root, "Save Selection",
-            [("name", f"Preset name   ({len(sel)} node(s): {' + '.join(types)})", "entry", ""),
+            self.root, "Save Clipboard",
+            [("name", f"Preset name   ({summary})", "entry", ""),
              ("folder", "Folder   (type a new name to create one)", "combo", default_folder),
              ("notes", "Notes   (optional)", "text", "")],
             combo_values={"folder": [""] + self.folders()},
@@ -699,12 +1254,7 @@ class FusionClipboard:
                 parent=self.root):
             return
 
-        settings, err = copy_settings(comp)
-        if not settings:
-            self.say(f"Could not copy the selection: {err}", True)
-            return
-
-        ok, werr = write_setting_file(path, settings)
+        ok, werr = write_setting_file(path, text)
         if not ok:
             self.say(f"Could not write '{name}': {werr}", True)
             return
@@ -716,31 +1266,260 @@ class FusionClipboard:
             "favorite": False,
         })
         self.refresh()
-        self.say(f"Saved '{name}' ({len(sel)} node(s)) to {folder or 'the library root'}.")
+        self.say(f"Saved '{name}' ({summary}) to {folder or 'the library root'}.")
 
     def paste(self):
+        """Put the preset on the clipboard. Fusion is never touched — you press
+        Ctrl+V yourself, which is what keeps Group controls intact."""
         if not self.current:
-            self.say("Select a preset to paste.", True)
-            return
-        comp = current_comp()
-        if not comp:
-            self.say("No Fusion comp open — open a clip on the Fusion page first.", True)
+            self.say("Select a preset to copy.", True)
             return
 
-        settings, err = read_setting_file(self.current["path"])
-        if settings is None:
+        text, err = read_setting_file(self.current["path"])
+        if text is None:
             self.say(f"Could not read the preset file: {err}", True)
             return
 
-        ok, how, errors = paste_settings(comp, settings)
-        if ok:
-            recent = [r for r in self.prefs.get("recent", []) if r != self.current["rel"]]
-            recent.insert(0, self.current["rel"])
-            self.prefs["recent"] = recent[:RECENT_MAX]
-            save_prefs(self.prefs)
-            self.say(f"Pasted '{self.current['name']}' via {how}.")
+        ok, cerr = set_clipboard_text(text)
+        if not ok:
+            self.say(f"Could not reach the clipboard: {cerr}", True)
+            return
+
+        recent = [r for r in self.prefs.get("recent", []) if r != self.current["rel"]]
+        recent.insert(0, self.current["rel"])
+        self.prefs["recent"] = recent[:RECENT_MAX]
+        save_prefs(self.prefs)
+        self.say(f"'{self.current['name']}' is on the clipboard — "
+                 f"switch to Fusion and press Ctrl+V.")
+
+    def paste_studio_safe(self):
+        """Convert ResolveFX nodes to native ones and put THAT on the clipboard.
+
+        The stored preset is never touched: it is the authored original, the
+        conversion is lossy, and backup_path() is a single slot - converting over
+        the top would destroy the only thing left to re-calibrate against.
+        """
+        if not self.current:
+            self.say("Select a preset to copy.", True)
+            return
+
+        text, err = read_setting_file(self.current["path"])
+        if text is None:
+            self.say(f"Could not read the preset file: {err}", True)
+            return
+
+        rules, problems = load_rules()
+        if problems:
+            self.say("Rules file problem — " + "; ".join(problems), True)
+            return
+
+        converted, report = convert_blob(text, rules)
+
+        if not report["converted"] and not report["skipped"] \
+                and not report["blocked"] and not report["nested"]:
+            ok, cerr = set_clipboard_text(text)
+            if not ok:
+                self.say(f"Could not reach the clipboard: {cerr}", True)
+                return
+            self.say(f"'{self.current['name']}' is on the clipboard — it has no "
+                     f"ResolveFX nodes, so this is the same as a normal copy.")
+            return
+
+        if report["blocked"]:
+            name, rule_id, missing = report["blocked"][0]
+            self.say(f"Nothing copied — the '{rule_id}' rule still has unverified "
+                     f"values ({missing[0]}). Run Learn Node on the native tool "
+                     f"first.", True)
+            return
+
+        # Only confirm when the result would be imperfect; a clean conversion is
+        # one silent click.
+        warnings = []
+        for name, kind, why in report["skipped"]:
+            warnings.append(f"  {name} ({kind.rsplit('.', 1)[-1]}) — {why}")
+        if report["nested"]:
+            warnings.append(f"  {report['nested']} ResolveFX node(s) inside a Group "
+                            f"— convert those inside the Group in Fusion")
+        if warnings:
+            done = "\n".join(f"  {n} → {t}" for n, _s, t in report["converted"]) \
+                   or "  (none)"
+            if not messagebox.askyesno(
+                    "Fusion Clipboard",
+                    f"Converted:\n{done}\n\nStill ResolveFX, will be missing in "
+                    f"Fusion Studio:\n" + "\n".join(warnings) + "\n\nCopy anyway?",
+                    parent=self.root):
+                self.say("Cancelled — nothing copied.")
+                return
+
+        if report["converted"]:
+            # Never hand over a blob that failed its own checks.
+            issues = validate_conversion(text, converted)
+            if issues:
+                self.say("Conversion rejected by its own checks (" + issues[0]
+                         + ") — nothing copied, the clipboard is untouched.", True)
+                print("Studio-safe validation failed:")
+                for issue in issues:
+                    print(f"  {issue}")
+                return
+
+        ok, cerr = set_clipboard_text(converted)
+        if not ok:
+            self.say(f"Could not reach the clipboard: {cerr}", True)
+            return
+
+        bits = [f"{len(report['converted'])} converted"]
+        if report["skipped"]:
+            bits.append(f"{len(report['skipped'])} left as ResolveFX")
+        if report["nested"]:
+            bits.append(f"{report['nested']} nested, untouched")
+        self.say(f"'{self.current['name']}' copied Studio-safe — " + ", ".join(bits)
+                 + ".  Switch to Fusion and press Ctrl+V.",
+                 error=bool(report["skipped"] or report["nested"]))
+
+    def learn_node(self):
+        """Report a clipboard node's real schema, so rules are written from fact.
+
+        This exists because a wrong target input name cannot be detected from the
+        text — Fusion accepts unknown inputs silently and pastes the node at its
+        defaults. The only defence is capturing the real names first.
+        """
+        text, err = get_clipboard_text()
+        if not text:
+            self.say(f"Nothing on the clipboard — {err}. Copy a node in Fusion "
+                     f"with Ctrl+C first.", True)
+            return
+
+        blocks = scan_blocks(text)
+        if not blocks:
+            self.say("No Fusion nodes found on the clipboard.", True)
+            return
+
+        lines = [
+            "Fusion Clipboard - Learn Node",
+            "",
+            "NOTE: Fusion only writes out inputs that are OFF their default, so a",
+            "node left at defaults looks almost empty here. Nudge every control",
+            "you care about before copying, or the capture will be misleading.",
+            "",
+        ]
+        for block in blocks:
+            lines.append("=" * 68)
+            lines.append(f"name        {block['name']}")
+            lines.append(f"type        {block['type']}")
+            if not block["inputs_span"]:
+                lines.append("inputs      (none serialised)")
+                lines.append("")
+                continue
+            entries = split_entries(text, *block["inputs_span"])
+            lines.append(f"inputs      {len(entries)}")
+            for entry in entries:
+                value = " ".join(entry["value"].split())
+                if len(value) > 68:
+                    value = value[:66] + "..."
+                tag = "connected" if _is_connected(entry["value"]) else "const    "
+                lines.append(f"  {tag}  {entry['key']:<28} {value}")
+            image = [e["key"] for e in entries if _is_connected(e["value"])]
+            if image:
+                lines.append(f"image input likely: {image[0]}")
+            lines.append("")
+
+        report = "\n".join(lines)
+        print("\n" + report)
+
+        try:
+            store = {}
+            if os.path.exists(RULES_FILE):
+                with open(RULES_FILE, "r", encoding="utf-8") as f:
+                    store = json.load(f)
+            captures = store.setdefault("captures", {})
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            for block in blocks:
+                key = f"{block['type']}@{stamp}"
+                captures[key] = {
+                    "name": block["name"],
+                    "type": block["type"],
+                    "inputs": [
+                        {"key": e["key"], "value": " ".join(e["value"].split()),
+                         "connected": _is_connected(e["value"])}
+                        for e in (split_entries(text, *block["inputs_span"])
+                                  if block["inputs_span"] else [])
+                    ],
+                }
+            with open(RULES_FILE, "w", encoding="utf-8") as f:
+                json.dump(store, f, indent=2)
+        except Exception as e:
+            print(f"Could not record the capture: {e}")
+
+        set_clipboard_text(report)
+        self.say(f"Learned {len(blocks)} node(s) — report printed to the console, "
+                 f"saved to {os.path.basename(RULES_FILE)}, and copied to the "
+                 f"clipboard so you can paste it.")
+
+    def update_from_clipboard(self):
+        """Replace a preset's contents, keeping its name, folder, notes and
+        favorite flag. Saves you deleting and re-saving to revise a template.
+
+        No confirmation dialog - the previous version is written to a .bak
+        beside it instead, which is both quicker and safer than a yes/no box.
+        Scanning only picks up .setting files, so the backup never shows in the
+        list.
+        """
+        if not self.current:
+            self.say("Select the preset you want to update.", True)
+            return
+
+        text, err = get_clipboard_text()
+        if not text:
+            self.say(f"Nothing to update from — {err}. Copy the new version in "
+                     f"Fusion with Ctrl+C first.", True)
+            return
+
+        types = parse_tool_types(text)
+        if looks_like_fusion_nodes(text):
+            what = " + ".join(types) if types else "the clipboard contents"
+            question = (f"Replace '{self.current['name']}' with {what}?\n\n"
+                        "Its name, folder, notes and favorite are kept. The old "
+                        "version is saved beside it as a .bak.")
         else:
-            self.say("Paste failed — " + " | ".join(errors or ["no method succeeded"]), True)
+            preview = text.strip().replace("\n", " ")[:60]
+            question = ("The clipboard doesn't look like Fusion nodes:\n\n"
+                        f"  {preview}...\n\n"
+                        f"Replace '{self.current['name']}' with it anyway?")
+
+        if not messagebox.askyesno("Fusion Clipboard", question, parent=self.root):
+            self.say("Update cancelled — nothing changed.")
+            return
+
+        path = self.current["path"]
+        backup = backup_path(path)
+        try:
+            if os.path.exists(path):
+                shutil.copy2(path, backup)
+        except OSError as e:
+            self.say(f"Could not back up the old version ({e}) — nothing changed.", True)
+            return
+
+        ok, werr = write_setting_file(path, text)
+        if not ok:
+            self.say(f"Could not write the update: {werr}", True)
+            return
+
+        meta = dict(self.current["meta"])        # keep notes / favorite / created
+        meta["tools"] = types
+        meta["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        write_meta(path, meta)
+
+        name = self.current["name"]
+        rel = self.current["rel"]
+        self.refresh()
+        for i, p in enumerate(self.visible):     # keep it selected after the rescan
+            if p["rel"] == rel:
+                self.list.selection_set(str(i))
+                self.list.see(str(i))
+                break
+        summary = f"{len(types)} node(s): {' + '.join(types)}" if types else "clipboard text"
+        self.say(f"Updated '{name}' — {summary}. Previous version kept as "
+                 f"{os.path.basename(backup)}.")
 
     def toggle_favorite(self):
         if not self.current:
@@ -781,8 +1560,10 @@ class FusionClipboard:
             return
         try:
             os.rename(self.current["path"], new_path)
-            if os.path.exists(meta_path(self.current["path"])):
-                os.rename(meta_path(self.current["path"]), meta_path(new_path))
+            for old, new_name in zip(companion_paths(self.current["path"]),
+                                     companion_paths(new_path)):
+                if os.path.exists(old):
+                    os.rename(old, new_name)
         except OSError as e:
             self.say(f"Rename failed: {e}", True)
             return
@@ -809,9 +1590,10 @@ class FusionClipboard:
             return
         try:
             shutil.move(self.current["path"], new_path)
-            old_meta = meta_path(self.current["path"])
-            if os.path.exists(old_meta):
-                shutil.move(old_meta, meta_path(new_path))
+            for old, new_name in zip(companion_paths(self.current["path"]),
+                                     companion_paths(new_path)):
+                if os.path.exists(old):
+                    shutil.move(old, new_name)
         except OSError as e:
             self.say(f"Move failed: {e}", True)
             return
@@ -828,9 +1610,9 @@ class FusionClipboard:
             return
         try:
             os.remove(self.current["path"])
-            mp = meta_path(self.current["path"])
-            if os.path.exists(mp):
-                os.remove(mp)
+            for companion in companion_paths(self.current["path"]):
+                if os.path.exists(companion):
+                    os.remove(companion)
         except OSError as e:
             self.say(f"Delete failed: {e}", True)
             return
