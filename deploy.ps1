@@ -83,22 +83,40 @@ if ($jsxScripts.Count -gt 0) {
     } else {
         $aeScripts = Join-Path $aeDirs[-1].FullName "Support Files\Scripts"
         $jsxCopied = 0
+        $stale = @()
         foreach ($file in $jsxScripts) {
+            $target = Join-Path $aeScripts $file.Name
+            # Only act when the installed copy actually differs. The old
+            # behaviour warned on EVERY deploy, so a genuinely outdated script
+            # looked exactly like routine noise - which is how AE ended up
+            # running a months-old FxLink Export with no sign anything was wrong.
+            if ((Test-Path $target) -and
+                ((Get-FileHash $target).Hash -eq (Get-FileHash $file.FullName).Hash)) {
+                Write-Host "AE script up to date: $($file.Name)"
+                continue
+            }
             try {
                 if (-not (Test-Path $aeScripts)) {
                     New-Item -ItemType Directory -Path $aeScripts -Force -ErrorAction Stop | Out-Null
                 }
-                Copy-Item -Path $file.FullName -Destination (Join-Path $aeScripts $file.Name) -Force -ErrorAction Stop
+                Copy-Item -Path $file.FullName -Destination $target -Force -ErrorAction Stop
                 Write-Host "Deployed to AE: $($file.Name)"
                 $jsxCopied++
             } catch {
-                Write-Host "WARNING: Could not copy '$($file.Name)' to '$aeScripts' (needs admin rights)."
-                Write-Host "  Either run this deploy script elevated once, or run the .jsx from AE via File > Scripts > Run Script File."
+                if (Test-Path $target) { $stale += "$($file.Name)  (outdated)" }
+                else { $stale += "$($file.Name)  (not installed yet)" }
             }
         }
         if ($jsxCopied -gt 0) {
             Write-Host "$jsxCopied .jsx script(s) deployed to:"
             Write-Host "  $aeScripts"
+        }
+        if ($stale.Count -gt 0) {
+            Write-Host ""
+            Write-Host "!! After Effects needs these scripts updated:" -ForegroundColor Red
+            foreach ($name in $stale) { Write-Host "     $name" -ForegroundColor Red }
+            Write-Host "   Program Files needs admin rights. Run this once to update it:" -ForegroundColor Red
+            Write-Host "     .\install_ae_scripts.ps1      (Windows will ask for permission)" -ForegroundColor Red
         }
     }
 }

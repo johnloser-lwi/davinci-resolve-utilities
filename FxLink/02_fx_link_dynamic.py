@@ -14,6 +14,19 @@ PREFS_FILE = os.path.expandvars(r"%APPDATA%\fxlink_prefs.json")
 CLIP_COLOR = "Pink"
 STAGING_DIR = os.path.join(tempfile.gettempdir(), "fxlink_staging")
 
+# Image sequences. A sequence lives in its own folder - FxLink\<name>\ and
+# Output\<name>\ - so hundreds of frames never litter the project folders.
+#
+# Frames are RENUMBERED FROM 0 when they move in. Resolve numbers a render from
+# its timeline position (00086400...), but After Effects numbers its renders
+# from 0, so without this an AE re-render would write different filenames and
+# never overwrite the frames Resolve is linked to. Starting at 0 with AE's own
+# 5-digit [#####] padding means both sides agree using AE's defaults, with no
+# dependence on Output Module settings.
+SEQUENCE_EXTS = (".png", ".exr", ".dpx", ".tif", ".tiff", ".jpg", ".jpeg",
+                 ".bmp", ".tga")
+SEQUENCE_PAD = 5
+
 
 def load_prefs():
     if os.path.exists(PREFS_FILE):
@@ -100,14 +113,70 @@ def find_any_pink_clip_path(timeline):
     return None
 
 
+def link_identity(file_path):
+    """(aep folder, comp name) for a linked Output file, or (None, None).
+
+    A movie links as      <aep folder>\\Output\\<comp>.mov
+    a sequence links as   <aep folder>\\Output\\<comp>\\<comp>_[00000-00100].png
+    (Resolve reports a sequence's File Path in that bracket form). Walking up to
+    the Output folder handles both, where "the parent's parent" only fits the
+    movie case.
+    """
+    parts = os.path.normpath(file_path).split(os.sep)
+    lowered = [p.lower() for p in parts]
+    if "output" not in lowered:
+        return None, None
+    at = len(lowered) - 1 - lowered[::-1].index("output")
+    rest = parts[at + 1:]
+    if not rest:
+        return None, None
+    aep_dir = os.sep.join(parts[:at])
+    if len(rest) >= 2:
+        return aep_dir, rest[0]                     # sequence: its folder name
+    return aep_dir, os.path.splitext(rest[0])[0]    # movie: its file stem
+
+
 def find_aep_for_output(file_path):
-    """The linked file lives in <aep folder>\\Output\\, so the .aep sits one
-    level up. Returns the newest .aep there, or None."""
-    project_dir = os.path.dirname(os.path.dirname(file_path))
-    aeps = glob.glob(os.path.join(project_dir, "*.aep"))
+    """The newest .aep beside the Output folder the linked file lives in."""
+    aep_dir, _comp = link_identity(file_path)
+    if not aep_dir:
+        return None
+    aeps = glob.glob(os.path.join(aep_dir, "*.aep"))
     if not aeps:
         return None
     return max(aeps, key=os.path.getmtime)
+
+
+def collect_render(render_dir, custom_name):
+    """What the render produced: ("movie", path), ("sequence", [paths in frame
+    order]) or (None, None).
+
+    The frame number is read from what FOLLOWS the known custom name, not by
+    pattern-matching the whole filename: the custom name ends in a timestamp,
+    and a regex for "trailing digits" would happily glue that timestamp onto the
+    frame number.
+    """
+    try:
+        names = [n for n in os.listdir(render_dir) if n.startswith(custom_name)]
+    except OSError:
+        return None, None
+
+    for name in names:
+        if os.path.splitext(name)[0] == custom_name:
+            return "movie", os.path.join(render_dir, name)
+
+    frames = []
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in SEQUENCE_EXTS:
+            continue
+        match = re.search(r"(\d+)$", stem[len(custom_name):])
+        if match:
+            frames.append((int(match.group(1)), os.path.join(render_dir, name)))
+    if frames:
+        frames.sort()
+        return "sequence", [path for _n, path in frames]
+    return None, None
 
 
 def find_afterfx(prefs):
@@ -245,10 +314,23 @@ try {
     var fxlinkFolder = findOrAddFolder("FxLink");
     var outputFolder = findOrAddFolder("Output");
 
-    var footage = proj.importFile(new ImportOptions(File("__SRC_FILE__")));
+    var opts = new ImportOptions(File("__SRC_FILE__"));
+    var isSequence = __IS_SEQUENCE__;
+    if (isSequence) {
+        // Without this AE imports the first frame as a single still.
+        opts.sequence = true;
+    }
+    var footage = proj.importFile(opts);
     footage.parentFolder = fxlinkFolder;
+    if (isSequence) {
+        // A sequence has no frame rate of its own - AE would use its default.
+        footage.mainSource.conformFrameRate = __FPS__;
+    }
 
-    var compName = footage.name.replace(/\\.[^\\.]+$/, "");
+    // Named explicitly: it must equal the Output name, because that is how
+    // Resolve's link finds its comp again. Taken from the footage instead, a
+    // sequence would give "name_[00000-00100]".
+    var compName = "__COMP_NAME__";
     var comp = proj.items.addComp(compName, footage.width, footage.height,
                                   footage.pixelAspect, footage.duration, footage.frameRate);
     comp.parentFolder = outputFolder;
@@ -323,10 +405,12 @@ else:
     elif linked_path:
         # Connect flow: the Pink clip's path maps to the AE project — launch
         # AE with it or switch the running AE to it as needed.
-        linked_comp = os.path.splitext(os.path.basename(linked_path))[0]
+        linked_dir, linked_comp = link_identity(linked_path)
         aep_path = find_aep_for_output(linked_path)
         if not aep_path:
-            print(f"Error: No .aep project found in '{os.path.dirname(os.path.dirname(linked_path))}'.")
+            print(f"Error: No .aep project found beside the Output folder for '{linked_path}'.")
+            if linked_dir:
+                print(f"  (looked in {linked_dir})")
         elif ensure_ae_project(afterfx_exe, aep_path):
             print(f"Opening comp '{linked_comp}' in After Effects...")
             result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
@@ -366,8 +450,6 @@ else:
 
                 # Render into a local staging folder first — After Effects is not
                 # contacted at all until the render is finished and placed in Resolve.
-                os.makedirs(STAGING_DIR, exist_ok=True)
-
                 timeline_name = "".join(
                     c for c in timeline.GetName() if c.isalnum() or c in " _-"
                 ).strip().replace(" ", "_")
@@ -377,10 +459,16 @@ else:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 custom_name = f"{timeline_name}_FxLink_tmp_{timestamp}"
 
+                # Every render gets a staging folder of its own, so an image
+                # sequence's frames can never mix with leftovers from an
+                # earlier attempt.
+                render_dir = os.path.join(STAGING_DIR, custom_name)
+                os.makedirs(render_dir, exist_ok=True)
+
                 # No ExportAudio override — the selected preset decides.
                 project.SetRenderSettings({
                     "SelectAllFrames": False,
-                    "TargetDir": STAGING_DIR,
+                    "TargetDir": render_dir,
                     "CustomName": custom_name,
                 })
 
@@ -404,16 +492,18 @@ else:
                     if status.get("JobStatus") != "Complete":
                         print(f"Render did not complete successfully. Status: {status.get('JobStatus', 'Unknown')}")
                     else:
-                        # Find the rendered file by name regardless of extension
-                        staged_path = None
-                        for fname in os.listdir(STAGING_DIR):
-                            if os.path.splitext(fname)[0] == custom_name:
-                                staged_path = os.path.join(STAGING_DIR, fname)
-                                break
+                        # A movie is one file named exactly custom_name; an image
+                        # sequence is custom_name plus a frame number per file.
+                        # The old lookup only knew the first, so a PNG sequence
+                        # always ended in "Could not find rendered file".
+                        kind, staged = collect_render(render_dir, custom_name)
+                        safe_at = render_dir if kind == "sequence" else staged
 
-                        if not staged_path:
-                            print(f"Error: Could not find rendered file '{custom_name}' in '{STAGING_DIR}'.")
+                        if not kind:
+                            print(f"Error: The render finished but nothing named '{custom_name}' turned up in '{render_dir}'.")
                         else:
+                            if kind == "sequence":
+                                print(f"Rendered an image sequence of {len(staged)} frame(s).")
                             print("Render complete. Asking After Effects for the open project path...")
                             aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
 
@@ -426,13 +516,13 @@ else:
 
                             if aep_path is None:
                                 print("Error: After Effects did not respond. Is it busy with a modal dialog?")
-                                print(f"The render is safe at: {staged_path}")
+                                print(f"The render is safe at: {safe_at}")
                             elif aep_path == "__UNSAVED__":
                                 print("Error: The open AE project has never been saved. Save it first so it has a folder.")
-                                print(f"The render is safe at: {staged_path}")
+                                print(f"The render is safe at: {safe_at}")
                             elif not os.path.exists(aep_path):
                                 print(f"Error: AE reported project path '{aep_path}' but it does not exist.")
-                                print(f"The render is safe at: {staged_path}")
+                                print(f"The render is safe at: {safe_at}")
                             else:
                                 aep_dir = os.path.dirname(aep_path)
                                 fxlink_dir = os.path.join(aep_dir, "FxLink")
@@ -442,7 +532,9 @@ else:
                                 print(f"AE project: {aep_path}")
 
                                 # Final name: [Timeline Name]_FxLink_[001], incremented
-                                # from the existing files in the FxLink folder.
+                                # from what is already in the FxLink folder. A movie
+                                # is a file with that stem, a sequence a folder with
+                                # that name - the stem test below fits both.
                                 base = f"{timeline_name}_FxLink_"
                                 highest = 0
                                 for existing in os.listdir(fxlink_dir):
@@ -450,13 +542,38 @@ else:
                                     m = re.fullmatch(re.escape(base) + r"(\d+)", stem)
                                     if m:
                                         highest = max(highest, int(m.group(1)))
+                                final_name = f"{base}{highest + 1:03d}"
 
-                                ext = os.path.splitext(staged_path)[1]
-                                final_name = f"{base}{highest + 1:03d}{ext}"
-                                render_path = os.path.join(fxlink_dir, final_name)
-                                shutil.move(staged_path, render_path)
-                                output_path = os.path.join(output_dir, os.path.basename(render_path))
-                                shutil.copy2(render_path, output_path)
+                                if kind == "movie":
+                                    ext = os.path.splitext(staged)[1]
+                                    render_path = os.path.join(fxlink_dir, final_name + ext)
+                                    shutil.move(staged, render_path)
+                                    output_path = os.path.join(output_dir, final_name + ext)
+                                    shutil.copy2(render_path, output_path)
+                                    import_info = output_path
+                                else:
+                                    # Own folder each side, frames renumbered from 0
+                                    # (see SEQUENCE_PAD for why).
+                                    ext = os.path.splitext(staged[0])[1]
+                                    fx_seq = os.path.join(fxlink_dir, final_name)
+                                    out_seq = os.path.join(output_dir, final_name)
+                                    os.makedirs(fx_seq, exist_ok=True)
+                                    os.makedirs(out_seq, exist_ok=True)
+                                    for index, source in enumerate(staged):
+                                        frame_name = f"{final_name}_{index:0{SEQUENCE_PAD}d}{ext}"
+                                        moved = os.path.join(fx_seq, frame_name)
+                                        shutil.move(source, moved)
+                                        shutil.copy2(moved, os.path.join(out_seq, frame_name))
+                                    render_path = os.path.join(fx_seq, f"{final_name}_{0:0{SEQUENCE_PAD}d}{ext}")
+                                    output_path = out_seq
+                                    import_info = {
+                                        "FilePath": os.path.join(out_seq, f"{final_name}_%0{SEQUENCE_PAD}d{ext}"),
+                                        "StartIndex": 0,
+                                        "EndIndex": len(staged) - 1,
+                                    }
+
+                                # The staging folder is empty now; tidy it away.
+                                shutil.rmtree(render_dir, ignore_errors=True)
                                 print(f"Source: {render_path}")
                                 print(f"Output copy: {output_path}")
 
@@ -473,13 +590,26 @@ else:
                                     ae_bin = media_pool.AddSubFolder(root_folder, "FxLink")
                                 media_pool.SetCurrentFolder(ae_bin)
 
-                                imported = media_pool.ImportMedia([output_path])
+                                fps = timeline.GetSetting("timelineFrameRate") or 24
+                                imported = media_pool.ImportMedia([import_info])
                                 if not imported:
                                     print(f"Warning: Could not import '{output_path}' into media pool.")
                                 elif mark_in is None:
                                     print("Warning: Could not read MarkIn from render job. Skipping timeline placement.")
                                 else:
                                     clip = imported[0]
+                                    clip_start_frame = 0
+                                    if kind == "sequence":
+                                        # A sequence comes in at Resolve's default
+                                        # still-sequence rate, not the timeline's.
+                                        if not clip.SetClipProperty("FPS", str(fps)):
+                                            print(f"Warning: could not set the sequence's frame rate to {fps}.")
+                                        # Sequence clips index from their file numbers.
+                                        try:
+                                            clip_start_frame = int(float(clip.GetClipProperty("Start") or 0))
+                                        except (TypeError, ValueError):
+                                            clip_start_frame = 0
+
                                     clip_total_frames = int(clip.GetClipProperty("Frames"))
                                     record_frame = mark_in
                                     clip_end = mark_out + 1 if mark_out is not None else mark_in + clip_total_frames
@@ -497,8 +627,8 @@ else:
 
                                     placed = media_pool.AppendToTimeline([{
                                         "mediaPoolItem": clip,
-                                        "startFrame": 0,
-                                        "endFrame": clip_total_frames,
+                                        "startFrame": clip_start_frame,
+                                        "endFrame": clip_start_frame + clip_total_frames,
                                         "mediaType": 1,
                                         "trackIndex": target_track,
                                         "recordFrame": record_frame,
@@ -516,7 +646,11 @@ else:
 
                                 # --- Everything in Resolve is done; now set up the AE project ---
                                 print("Setting up After Effects project...")
-                                setup_jsx = SETUP_PROJECT_JSX.replace("__SRC_FILE__", render_path.replace("\\", "/"))
+                                setup_jsx = (SETUP_PROJECT_JSX
+                                             .replace("__SRC_FILE__", render_path.replace("\\", "/"))
+                                             .replace("__COMP_NAME__", final_name)
+                                             .replace("__IS_SEQUENCE__", "true" if kind == "sequence" else "false")
+                                             .replace("__FPS__", repr(float(fps))))
                                 ae_result = run_extendscript(afterfx_exe, setup_jsx, timeout=30)
 
                                 if ae_result is None:
@@ -524,5 +658,7 @@ else:
                                 elif ae_result.startswith("OK"):
                                     print("AE ready: comp created and opened.")
                                     print("Work in AE, then select the comp and run FxLink Export to overwrite the Output file — Resolve will pick it up.")
+                                    if kind == "sequence":
+                                        print("For a sequence, give FxLink Export an Output Module template named 'FxLink Sequence' that renders the same image format.")
                                 else:
                                     print(f"Warning: AE setup failed: {ae_result}")
