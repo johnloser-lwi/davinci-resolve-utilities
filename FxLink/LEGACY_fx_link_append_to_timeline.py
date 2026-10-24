@@ -1,5 +1,17 @@
 import os
 
+# LEGACY - kept for reference, not part of the current FxLink workflow.
+#
+# This is the return half of the original marker workflow: it took a folder of
+# finished renders and laid file 1 on the first "Fx Link" marker, file 2 on the
+# second, and so on. The dynamic link (02) and the FxLink Queue (04) replaced
+# that loop - their renders land in the AE project's FxLink/Output folders,
+# come back as Pink linked clips, and support refresh and partial renders.
+#
+# Things to know if you do run it: nothing it places is linked (no Pink, no AE
+# comp), and it treats every .png/.tif in the folder as its own clip, so an
+# image sequence comes in as one clip per frame.
+
 resolve = bmd.scriptapp("Resolve")
 fusion = resolve.Fusion()
 

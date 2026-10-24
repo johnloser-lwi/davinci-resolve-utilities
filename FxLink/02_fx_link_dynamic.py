@@ -88,19 +88,25 @@ def default_audio_preset(preset_names, last_audio_preset=None):
 
 
 def ask_options(preset_names, last_preset=None, last_mode=MODE_FOOTAGE,
-                last_audio_preset=None):
+                last_audio_preset=None, parent=None, title="FxLink"):
     """What to send to After Effects, and which presets to render it with.
 
     Returns (picture preset, mode, audio preset), or (None, None, None) if
     cancelled.
+
+    With a parent (the FxLink Queue window) it opens as a child window of it.
+    Opening a second Tk() inside a running Tk app instead would bind this
+    dialog's radio buttons to the OTHER window's variables, and they'd silently
+    stop working - so the variable is also given its own master explicitly.
     """
     selected = [None, None, None]
 
-    root = tk.Tk()
-    root.title("FxLink")
+    root = tk.Toplevel(parent) if parent is not None else tk.Tk()
+    root.title(title)
     root.resizable(False, False)
 
-    mode_var = tk.StringVar(value=last_mode if last_mode in (MODE_FOOTAGE, MODE_AUDIO)
+    mode_var = tk.StringVar(master=root,
+                            value=last_mode if last_mode in (MODE_FOOTAGE, MODE_AUDIO)
                             else MODE_FOOTAGE)
     modes = tk.Frame(root, padx=12, pady=8)
     modes.pack(fill="x")
@@ -164,7 +170,12 @@ def ask_options(preset_names, last_preset=None, last_mode=MODE_FOOTAGE,
 
     root.lift()
     root.attributes("-topmost", True)
-    root.mainloop()
+    if parent is not None:
+        root.transient(parent)
+        root.grab_set()
+        parent.wait_window(root)        # modal, inside the parent's event loop
+    else:
+        root.mainloop()
 
     return selected[0], selected[1], selected[2]
 
@@ -645,360 +656,379 @@ def ensure_ae_project(afterfx_exe, aep_path, timeout=90):
     return False
 
 
-resolve = bmd.scriptapp("Resolve")
-fusion = resolve.Fusion()
+def main(job=None):
+    """Run FxLink once.
 
-projectManager = resolve.GetProjectManager()
-project = projectManager.GetCurrentProject()
-timeline = project.GetCurrentTimeline()
+    job is None for the normal interactive run (the menu asks for settings).
+    The FxLink Queue passes a dict with "preset", "mode" and "audio_preset"
+    instead: the menu is skipped, and so is "reopen the comp under the
+    playhead" - a queued range is always a new render, wherever the playhead
+    happens to be.
+    """
+    resolve = bmd.scriptapp("Resolve")
+    fusion = resolve.Fusion()
 
-if not timeline:
-    problem("Error: No timeline is currently open.")
-else:
-    playhead_tc = timeline.GetCurrentTimecode()
-    prefs = load_prefs()
+    projectManager = resolve.GetProjectManager()
+    project = projectManager.GetCurrentProject()
+    timeline = project.GetCurrentTimeline()
 
-    afterfx_exe = find_afterfx(prefs)
-    linked_path = find_linked_clip_path_under_playhead(timeline)
-
-    ae_running = afterfx_running()
-    aep_hint = None
-    if not ae_running and not linked_path:
-        pink_path = find_any_pink_clip_path(timeline)
-        if pink_path:
-            aep_hint = find_aep_for_output(pink_path)
-
-    if not afterfx_exe:
-        problem("Error: Could not find AfterFX.exe under C:\\Program Files\\Adobe.")
-    elif linked_path:
-        # Connect flow: the Pink clip's path maps to the AE project — launch
-        # AE with it or switch the running AE to it as needed.
-        linked_dir, linked_comp = link_identity(linked_path)
-        aep_path = find_aep_for_output(linked_path)
-        if not aep_path:
-            problem(f"Error: No .aep project found beside the Output folder for '{linked_path}'.")
-            if linked_dir:
-                print(f"  (looked in {linked_dir})")
-        elif ensure_ae_project(afterfx_exe, aep_path):
-            print(f"Opening comp '{linked_comp}' in After Effects...")
-            result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
-            if result == "OK":
-                print("Comp opened in After Effects.")
-            elif result == "NOT_FOUND":
-                print(f"Comp '{linked_comp}' was not found in project '{os.path.basename(aep_path)}'.")
-            elif result is None:
-                problem("Error: After Effects did not respond. Is it busy with a modal dialog?")
-            else:
-                problem(f"Error from AE: {result}")
-    elif not ae_running and not aep_hint:
-        problem("Error: After Effects is not running, and no FxLink clip on this timeline maps to a project.")
-        print("Open your AE project first (or place the playhead over an existing FxLink clip).")
+    if not timeline:
+        problem("Error: No timeline is currently open.")
     else:
-        if not ae_running:
-            # Launch AE with the mapped project now so it boots while Resolve
-            # renders; the post-render project query retries until it's up.
-            print(f"Launching After Effects with {os.path.basename(aep_hint)} — it will load during the render...")
-            subprocess.Popen([afterfx_exe, aep_hint])
+        playhead_tc = timeline.GetCurrentTimecode()
+        prefs = load_prefs()
 
-        presets_dict = project.GetRenderPresets()
-        preset_names = [presets_dict[k] for k in sorted(presets_dict.keys())]
+        afterfx_exe = find_afterfx(prefs)
+        linked_path = None if job else find_linked_clip_path_under_playhead(timeline)
 
-        if not preset_names:
-            problem("Error: No render presets found. Please create one in the Deliver page.")
+        ae_running = afterfx_running()
+        aep_hint = None
+        if not ae_running and not linked_path:
+            pink_path = find_any_pink_clip_path(timeline)
+            if pink_path:
+                aep_hint = find_aep_for_output(pink_path)
+
+        if not afterfx_exe:
+            problem("Error: Could not find AfterFX.exe under C:\\Program Files\\Adobe.")
+        elif linked_path:
+            # Connect flow: the Pink clip's path maps to the AE project — launch
+            # AE with it or switch the running AE to it as needed.
+            linked_dir, linked_comp = link_identity(linked_path)
+            aep_path = find_aep_for_output(linked_path)
+            if not aep_path:
+                problem(f"Error: No .aep project found beside the Output folder for '{linked_path}'.")
+                if linked_dir:
+                    print(f"  (looked in {linked_dir})")
+            elif ensure_ae_project(afterfx_exe, aep_path):
+                print(f"Opening comp '{linked_comp}' in After Effects...")
+                result = run_extendscript(afterfx_exe, OPEN_COMP_JSX.replace("__COMP_NAME__", linked_comp))
+                if result == "OK":
+                    print("Comp opened in After Effects.")
+                elif result == "NOT_FOUND":
+                    print(f"Comp '{linked_comp}' was not found in project '{os.path.basename(aep_path)}'.")
+                elif result is None:
+                    problem("Error: After Effects did not respond. Is it busy with a modal dialog?")
+                else:
+                    problem(f"Error from AE: {result}")
+        elif not ae_running and not aep_hint:
+            problem("Error: After Effects is not running, and no FxLink clip on this timeline maps to a project.")
+            print("Open your AE project first (or place the playhead over an existing FxLink clip).")
         else:
-            prefs = load_prefs()  # find_afterfx may have updated it
-            preset_name, mode, audio_preset = ask_options(
-                preset_names,
-                last_preset=prefs.get("last_preset"),
-                last_mode=prefs.get("last_mode", MODE_FOOTAGE),
-                last_audio_preset=prefs.get("last_audio_preset"))
-            audio_only = mode == MODE_AUDIO
+            if not ae_running:
+                # Launch AE with the mapped project now so it boots while Resolve
+                # renders; the post-render project query retries until it's up.
+                print(f"Launching After Effects with {os.path.basename(aep_hint)} — it will load during the render...")
+                subprocess.Popen([afterfx_exe, aep_hint])
 
-            if not preset_name:
-                print("Cancelled: No preset selected.")
-            elif not project.LoadRenderPreset(preset_name):
-                problem(f"Error: Could not load render preset '{preset_name}'.")
-            elif ((audio_only or loaded_preset_is_sequence(project))
-                  and audio_preset == preset_name):
-                # Checked before anything renders, so it costs nothing - the
-                # alternative is rendering the picture twice and failing anyway.
-                problem(f"Error: '{preset_name}' is selected for both the picture and the audio. "
-                        f"The audio preset needs to be one that exports audio only. "
-                        f"{AUDIO_PRESET_HOWTO}")
+            presets_dict = project.GetRenderPresets()
+            preset_names = [presets_dict[k] for k in sorted(presets_dict.keys())]
+
+            if not preset_names:
+                problem("Error: No render presets found. Please create one in the Deliver page.")
             else:
-                save_prefs({**load_prefs(), "last_preset": preset_name, "last_mode": mode,
-                            "last_audio_preset": audio_preset})
+                prefs = load_prefs()  # find_afterfx may have updated it
+                if job:
+                    preset_name = job.get("preset")
+                    mode = job.get("mode", MODE_FOOTAGE)
+                    audio_preset = job.get("audio_preset")
+                else:
+                    preset_name, mode, audio_preset = ask_options(
+                        preset_names,
+                        last_preset=prefs.get("last_preset"),
+                        last_mode=prefs.get("last_mode", MODE_FOOTAGE),
+                        last_audio_preset=prefs.get("last_audio_preset"))
+                audio_only = mode == MODE_AUDIO
 
-                # Render into a local staging folder first — After Effects is not
-                # contacted at all until the render is finished and placed in Resolve.
-                timeline_name = "".join(
-                    c for c in timeline.GetName() if c.isalnum() or c in " _-"
-                ).strip().replace(" ", "_")
-                # Render under a unique temp name; the final incremented name is
-                # applied when the file moves into the AE project's FxLink folder
-                # (we can't count existing files there until AE tells us the path).
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                custom_name = f"{timeline_name}_FxLink_tmp_{timestamp}"
+                if not preset_name:
+                    print("Cancelled: No preset selected.")
+                elif not project.LoadRenderPreset(preset_name):
+                    problem(f"Error: Could not load render preset '{preset_name}'.")
+                elif ((audio_only or loaded_preset_is_sequence(project))
+                      and audio_preset == preset_name):
+                    # Checked before anything renders, so it costs nothing - the
+                    # alternative is rendering the picture twice and failing anyway.
+                    problem(f"Error: '{preset_name}' is selected for both the picture and the audio. "
+                            f"The audio preset needs to be one that exports audio only. "
+                            f"{AUDIO_PRESET_HOWTO}")
+                else:
+                    save_prefs({**load_prefs(), "last_preset": preset_name, "last_mode": mode,
+                                "last_audio_preset": audio_preset})
 
-                # Every render gets staging folders of its own, so an image
-                # sequence's frames can never mix with leftovers from an
-                # earlier attempt, nor with the audio.
-                render_dir = os.path.join(STAGING_DIR, custom_name)
-                audio_dir = render_dir + "_audio"
-                os.makedirs(render_dir, exist_ok=True)
+                    # Render into a local staging folder first — After Effects is not
+                    # contacted at all until the render is finished and placed in Resolve.
+                    timeline_name = "".join(
+                        c for c in timeline.GetName() if c.isalnum() or c in " _-"
+                    ).strip().replace(" ", "_")
+                    # Render under a unique temp name; the final incremented name is
+                    # applied when the file moves into the AE project's FxLink folder
+                    # (we can't count existing files there until AE tells us the path).
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    custom_name = f"{timeline_name}_FxLink_tmp_{timestamp}"
 
-                picture_settings = {
-                    "SelectAllFrames": False,
-                    "TargetDir": render_dir,
-                    "CustomName": custom_name,
-                }
+                    # Every render gets staging folders of its own, so an image
+                    # sequence's frames can never mix with leftovers from an
+                    # earlier attempt, nor with the audio.
+                    render_dir = os.path.join(STAGING_DIR, custom_name)
+                    audio_dir = render_dir + "_audio"
+                    os.makedirs(render_dir, exist_ok=True)
 
-                kind = staged = audio_staged = None
-                mark_in = mark_out = None
-                failure = None
-                audio_attempted = False
-                try:
-                    if audio_only:
-                        # An empty placeholder in the preset's format - its own
-                        # audio isn't wanted, the WAV below is the reference.
-                        print("Rendering an empty placeholder (video tracks switched off for a moment)...")
-                        _job, mark_in, mark_out = render_placeholder(
-                            project, timeline, dict(picture_settings, ExportAudio=False))
-                    else:
-                        # No ExportAudio override — the selected preset decides.
-                        print(f"Rendering {custom_name} ...")
-                        _job, mark_in, mark_out = run_render(project, picture_settings, label="picture")
+                    picture_settings = {
+                        "SelectAllFrames": False,
+                        "TargetDir": render_dir,
+                        "CustomName": custom_name,
+                    }
 
-                    kind, staged = collect_render(render_dir, custom_name)
-                    if not kind:
-                        raise RuntimeError(f"The render finished but nothing named '{custom_name}' "
-                                           f"turned up in '{render_dir}'.")
-                    if kind == "sequence":
-                        print(f"Rendered an image sequence of {len(staged)} frame(s).")
-
-                    # An image sequence can't carry sound, so its audio is
-                    # rendered on its own - as is the whole point of audio-only.
-                    # A movie keeps the audio its preset gives it.
-                    if audio_preset and (audio_only or kind == "sequence"):
-                        print(f"Rendering the audio with '{audio_preset}'...")
-                        audio_attempted = True
-                        audio_staged = render_audio(project, audio_preset, audio_dir,
-                                                    custom_name + "_audio")
-                except RuntimeError as e:
-                    failure = str(e)
-                    problem(f"Error: {failure}")
-                    if os.listdir(render_dir):
-                        print(f"Anything already rendered is safe at: {render_dir}")
-                finally:
-                    # The audio render loaded its own preset; put yours back so
-                    # the Deliver page isn't left on audio-only.
-                    if audio_attempted:
-                        project.LoadRenderPreset(preset_name)
-
-                if failure is None and kind:
-                    safe_at = render_dir if kind == "sequence" else staged
-
-                    print("Render complete. Asking After Effects for the open project path...")
-                    aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
-
-                    # AE may still be starting up if we just launched it — retry
-                    retry_deadline = time.time() + 90
-                    while aep_path is None and time.time() < retry_deadline:
-                        print("Waiting for After Effects to finish starting up...")
-                        time.sleep(5)
-                        aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX, timeout=10)
-
-                    if aep_path is None:
-                        problem("Error: After Effects did not respond. Is it busy with a modal dialog?")
-                        print(f"The render is safe at: {safe_at}")
-                    elif aep_path == "__UNSAVED__":
-                        problem("Error: The open AE project has never been saved. Save it first so it has a folder.")
-                        print(f"The render is safe at: {safe_at}")
-                    elif not os.path.exists(aep_path):
-                        problem(f"Error: AE reported project path '{aep_path}' but it does not exist.")
-                        print(f"The render is safe at: {safe_at}")
-                    else:
-                        aep_dir = os.path.dirname(aep_path)
-                        fxlink_dir = os.path.join(aep_dir, "FxLink")
-                        output_dir = os.path.join(aep_dir, "Output")
-                        os.makedirs(fxlink_dir, exist_ok=True)
-                        os.makedirs(output_dir, exist_ok=True)
-                        print(f"AE project: {aep_path}")
-
-                        # Final name: [Timeline Name]_FxLink_[001], incremented
-                        # from what is already in the FxLink and Output folders.
-                        # A movie is a file with that stem, a sequence a folder
-                        # with that name, a WAV a file - the stem test fits all.
-                        # Output is checked too: an audio-only link puts nothing
-                        # picture-wise in FxLink.
-                        base = f"{timeline_name}_FxLink_"
-                        highest = 0
-                        for folder in (fxlink_dir, output_dir):
-                            for existing in os.listdir(folder):
-                                stem = os.path.splitext(existing)[0]
-                                m = re.fullmatch(re.escape(base) + r"(\d+)", stem)
-                                if m:
-                                    highest = max(highest, int(m.group(1)))
-                        final_name = f"{base}{highest + 1:03d}"
-
-                        # In audio-only mode the picture is only a placeholder:
-                        # it goes straight to Output for Resolve to link to, and
-                        # AE never imports it, so no source copy in FxLink.
-                        if kind == "movie":
-                            ext = os.path.splitext(staged)[1]
-                            output_path = os.path.join(output_dir, final_name + ext)
-                            if audio_only:
-                                shutil.move(staged, output_path)
-                                render_path = None
-                            else:
-                                render_path = os.path.join(fxlink_dir, final_name + ext)
-                                shutil.move(staged, render_path)
-                                shutil.copy2(render_path, output_path)
-                            import_info = output_path
+                    kind = staged = audio_staged = None
+                    mark_in = mark_out = None
+                    failure = None
+                    audio_attempted = False
+                    try:
+                        if audio_only:
+                            # An empty placeholder in the preset's format - its own
+                            # audio isn't wanted, the WAV below is the reference.
+                            print("Rendering an empty placeholder (video tracks switched off for a moment)...")
+                            _job, mark_in, mark_out = render_placeholder(
+                                project, timeline, dict(picture_settings, ExportAudio=False))
                         else:
-                            # Own folder each side, frames renumbered from 0
-                            # (see SEQUENCE_PAD for why).
-                            ext = os.path.splitext(staged[0])[1]
-                            out_seq = os.path.join(output_dir, final_name)
-                            fx_seq = os.path.join(fxlink_dir, final_name)
-                            os.makedirs(out_seq, exist_ok=True)
-                            if not audio_only:
-                                os.makedirs(fx_seq, exist_ok=True)
-                            for index, source in enumerate(staged):
-                                frame_name = f"{final_name}_{index:0{SEQUENCE_PAD}d}{ext}"
+                            # No ExportAudio override — the selected preset decides.
+                            print(f"Rendering {custom_name} ...")
+                            _job, mark_in, mark_out = run_render(project, picture_settings, label="picture")
+
+                        kind, staged = collect_render(render_dir, custom_name)
+                        if not kind:
+                            raise RuntimeError(f"The render finished but nothing named '{custom_name}' "
+                                               f"turned up in '{render_dir}'.")
+                        if kind == "sequence":
+                            print(f"Rendered an image sequence of {len(staged)} frame(s).")
+
+                        # An image sequence can't carry sound, so its audio is
+                        # rendered on its own - as is the whole point of audio-only.
+                        # A movie keeps the audio its preset gives it.
+                        if audio_preset and (audio_only or kind == "sequence"):
+                            print(f"Rendering the audio with '{audio_preset}'...")
+                            audio_attempted = True
+                            audio_staged = render_audio(project, audio_preset, audio_dir,
+                                                        custom_name + "_audio")
+                    except RuntimeError as e:
+                        failure = str(e)
+                        problem(f"Error: {failure}")
+                        if os.listdir(render_dir):
+                            print(f"Anything already rendered is safe at: {render_dir}")
+                    finally:
+                        # The audio render loaded its own preset; put yours back so
+                        # the Deliver page isn't left on audio-only.
+                        if audio_attempted:
+                            project.LoadRenderPreset(preset_name)
+
+                    if failure is None and kind:
+                        safe_at = render_dir if kind == "sequence" else staged
+
+                        print("Render complete. Asking After Effects for the open project path...")
+                        aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
+
+                        # AE may still be starting up if we just launched it — retry
+                        retry_deadline = time.time() + 90
+                        while aep_path is None and time.time() < retry_deadline:
+                            print("Waiting for After Effects to finish starting up...")
+                            time.sleep(5)
+                            aep_path = run_extendscript(afterfx_exe, GET_PROJECT_JSX, timeout=10)
+
+                        if aep_path is None:
+                            problem("Error: After Effects did not respond. Is it busy with a modal dialog?")
+                            print(f"The render is safe at: {safe_at}")
+                        elif aep_path == "__UNSAVED__":
+                            problem("Error: The open AE project has never been saved. Save it first so it has a folder.")
+                            print(f"The render is safe at: {safe_at}")
+                        elif not os.path.exists(aep_path):
+                            problem(f"Error: AE reported project path '{aep_path}' but it does not exist.")
+                            print(f"The render is safe at: {safe_at}")
+                        else:
+                            aep_dir = os.path.dirname(aep_path)
+                            fxlink_dir = os.path.join(aep_dir, "FxLink")
+                            output_dir = os.path.join(aep_dir, "Output")
+                            os.makedirs(fxlink_dir, exist_ok=True)
+                            os.makedirs(output_dir, exist_ok=True)
+                            print(f"AE project: {aep_path}")
+
+                            # Final name: [Timeline Name]_FxLink_[001], incremented
+                            # from what is already in the FxLink and Output folders.
+                            # A movie is a file with that stem, a sequence a folder
+                            # with that name, a WAV a file - the stem test fits all.
+                            # Output is checked too: an audio-only link puts nothing
+                            # picture-wise in FxLink.
+                            base = f"{timeline_name}_FxLink_"
+                            highest = 0
+                            for folder in (fxlink_dir, output_dir):
+                                for existing in os.listdir(folder):
+                                    stem = os.path.splitext(existing)[0]
+                                    m = re.fullmatch(re.escape(base) + r"(\d+)", stem)
+                                    if m:
+                                        highest = max(highest, int(m.group(1)))
+                            final_name = f"{base}{highest + 1:03d}"
+
+                            # In audio-only mode the picture is only a placeholder:
+                            # it goes straight to Output for Resolve to link to, and
+                            # AE never imports it, so no source copy in FxLink.
+                            if kind == "movie":
+                                ext = os.path.splitext(staged)[1]
+                                output_path = os.path.join(output_dir, final_name + ext)
                                 if audio_only:
-                                    shutil.move(source, os.path.join(out_seq, frame_name))
+                                    shutil.move(staged, output_path)
+                                    render_path = None
                                 else:
-                                    moved = os.path.join(fx_seq, frame_name)
-                                    shutil.move(source, moved)
-                                    shutil.copy2(moved, os.path.join(out_seq, frame_name))
-                            render_path = (None if audio_only else
-                                           os.path.join(fx_seq, f"{final_name}_{0:0{SEQUENCE_PAD}d}{ext}"))
-                            output_path = out_seq
-                            import_info = {
-                                "FilePath": os.path.join(out_seq, f"{final_name}_%0{SEQUENCE_PAD}d{ext}"),
-                                "StartIndex": 0,
-                                "EndIndex": len(staged) - 1,
-                            }
-
-                        audio_path = None
-                        if audio_staged:
-                            audio_path = os.path.join(fxlink_dir, final_name + os.path.splitext(audio_staged)[1])
-                            shutil.move(audio_staged, audio_path)
-
-                        # The staging folders are empty now; tidy them away.
-                        shutil.rmtree(render_dir, ignore_errors=True)
-                        shutil.rmtree(audio_dir, ignore_errors=True)
-                        if render_path:
-                            print(f"Source: {render_path}")
-                        if audio_path:
-                            print(f"Audio:  {audio_path}")
-                        print(f"Output: {output_path}")
-
-                        # --- Place the Output copy on the Resolve timeline ---
-                        media_pool = project.GetMediaPool()
-                        root_folder = media_pool.GetRootFolder()
-
-                        ae_bin = None
-                        for folder in root_folder.GetSubFolderList():
-                            if folder.GetName() == "FxLink":
-                                ae_bin = folder
-                                break
-                        if not ae_bin:
-                            ae_bin = media_pool.AddSubFolder(root_folder, "FxLink")
-                        media_pool.SetCurrentFolder(ae_bin)
-
-                        fps = timeline.GetSetting("timelineFrameRate") or 24
-                        frame_total = None
-                        imported = media_pool.ImportMedia([import_info])
-                        if not imported:
-                            problem(f"Warning: Could not import '{output_path}' into media pool.")
-                        elif mark_in is None:
-                            problem("Warning: Could not read MarkIn from render job. Skipping timeline placement.")
-                        else:
-                            clip = imported[0]
-                            clip_start_frame = 0
-                            if kind == "sequence":
-                                # A sequence comes in at Resolve's default
-                                # still-sequence rate, not the timeline's.
-                                if not clip.SetClipProperty("FPS", str(fps)):
-                                    problem(f"Warning: could not set the sequence's frame rate to {fps}.")
-                                # Sequence clips index from their file numbers.
-                                try:
-                                    clip_start_frame = int(float(clip.GetClipProperty("Start") or 0))
-                                except (TypeError, ValueError):
-                                    clip_start_frame = 0
-
-                            clip_total_frames = int(clip.GetClipProperty("Frames"))
-                            frame_total = clip_total_frames
-                            record_frame = mark_in
-                            clip_end = mark_out + 1 if mark_out is not None else mark_in + clip_total_frames
-
-                            total_tracks = timeline.GetTrackCount("video")
-                            highest_occupied = 0
-                            for track_idx in range(1, total_tracks + 1):
-                                items = timeline.GetItemListInTrack("video", track_idx) or []
-                                if any(item.GetStart() < clip_end and item.GetEnd() > record_frame for item in items):
-                                    highest_occupied = track_idx
-
-                            target_track = highest_occupied + 1
-                            if target_track > total_tracks:
-                                timeline.AddTrack("video")
-
-                            placed = media_pool.AppendToTimeline([{
-                                "mediaPoolItem": clip,
-                                "startFrame": clip_start_frame,
-                                "endFrame": clip_start_frame + clip_total_frames,
-                                "mediaType": 1,
-                                "trackIndex": target_track,
-                                "recordFrame": record_frame,
-                            }])
-
-                            timeline_item = placed[0] if placed else None
-                            if not timeline_item:
-                                problem("Warning: Could not place clip onto timeline (note: placement inside compound clips is not supported by the API).")
-                                print("The clip is in the FxLink bin — you can drag it manually.")
+                                    render_path = os.path.join(fxlink_dir, final_name + ext)
+                                    shutil.move(staged, render_path)
+                                    shutil.copy2(render_path, output_path)
+                                import_info = output_path
                             else:
-                                timeline_item.SetClipColor(CLIP_COLOR)
-                                print(f"Placed on video track {target_track} at frame {record_frame} ({CLIP_COLOR}).")
+                                # Own folder each side, frames renumbered from 0
+                                # (see SEQUENCE_PAD for why).
+                                ext = os.path.splitext(staged[0])[1]
+                                out_seq = os.path.join(output_dir, final_name)
+                                fx_seq = os.path.join(fxlink_dir, final_name)
+                                os.makedirs(out_seq, exist_ok=True)
+                                if not audio_only:
+                                    os.makedirs(fx_seq, exist_ok=True)
+                                for index, source in enumerate(staged):
+                                    frame_name = f"{final_name}_{index:0{SEQUENCE_PAD}d}{ext}"
+                                    if audio_only:
+                                        shutil.move(source, os.path.join(out_seq, frame_name))
+                                    else:
+                                        moved = os.path.join(fx_seq, frame_name)
+                                        shutil.move(source, moved)
+                                        shutil.copy2(moved, os.path.join(out_seq, frame_name))
+                                render_path = (None if audio_only else
+                                               os.path.join(fx_seq, f"{final_name}_{0:0{SEQUENCE_PAD}d}{ext}"))
+                                output_path = out_seq
+                                import_info = {
+                                    "FilePath": os.path.join(out_seq, f"{final_name}_%0{SEQUENCE_PAD}d{ext}"),
+                                    "StartIndex": 0,
+                                    "EndIndex": len(staged) - 1,
+                                }
 
-                            timeline.SetCurrentTimecode(playhead_tc)
+                            audio_path = None
+                            if audio_staged:
+                                audio_path = os.path.join(fxlink_dir, final_name + os.path.splitext(audio_staged)[1])
+                                shutil.move(audio_staged, audio_path)
 
-                        # --- Everything in Resolve is done; now set up the AE project ---
-                        # The comp's size and length come from the footage when
-                        # there is some; in audio-only mode, from the timeline.
-                        if frame_total is None and mark_in is not None and mark_out is not None:
-                            frame_total = mark_out - mark_in + 1
-                        try:
-                            width = int(float(timeline.GetSetting("timelineResolutionWidth") or 1920))
-                            height = int(float(timeline.GetSetting("timelineResolutionHeight") or 1080))
-                        except (TypeError, ValueError):
-                            width, height = 1920, 1080
-                        duration = (frame_total or 1) / float(fps)
+                            # The staging folders are empty now; tidy them away.
+                            shutil.rmtree(render_dir, ignore_errors=True)
+                            shutil.rmtree(audio_dir, ignore_errors=True)
+                            if render_path:
+                                print(f"Source: {render_path}")
+                            if audio_path:
+                                print(f"Audio:  {audio_path}")
+                            print(f"Output: {output_path}")
 
-                        print("Setting up After Effects project...")
-                        setup_jsx = (SETUP_PROJECT_JSX
-                                     .replace("__SRC_FILE__", (render_path or "").replace("\\", "/"))
-                                     .replace("__AUDIO_FILE__", (audio_path or "").replace("\\", "/"))
-                                     .replace("__COMP_NAME__", final_name)
-                                     .replace("__IS_SEQUENCE__", "true" if (kind == "sequence" and render_path) else "false")
-                                     .replace("__FPS__", repr(float(fps)))
-                                     .replace("__WIDTH__", str(width))
-                                     .replace("__HEIGHT__", str(height))
-                                     .replace("__DURATION__", repr(duration)))
-                        ae_result = run_extendscript(afterfx_exe, setup_jsx, timeout=30)
+                            # --- Place the Output copy on the Resolve timeline ---
+                            media_pool = project.GetMediaPool()
+                            root_folder = media_pool.GetRootFolder()
 
-                        if ae_result is None:
-                            problem("Warning: AE did not confirm project setup (timeout). Check AE manually.")
-                        elif ae_result.startswith("OK"):
-                            if audio_only:
-                                print("AE ready: comp created with the audio in it, no footage.")
+                            ae_bin = None
+                            for folder in root_folder.GetSubFolderList():
+                                if folder.GetName() == "FxLink":
+                                    ae_bin = folder
+                                    break
+                            if not ae_bin:
+                                ae_bin = media_pool.AddSubFolder(root_folder, "FxLink")
+                            media_pool.SetCurrentFolder(ae_bin)
+
+                            fps = timeline.GetSetting("timelineFrameRate") or 24
+                            frame_total = None
+                            imported = media_pool.ImportMedia([import_info])
+                            if not imported:
+                                problem(f"Warning: Could not import '{output_path}' into media pool.")
+                            elif mark_in is None:
+                                problem("Warning: Could not read MarkIn from render job. Skipping timeline placement.")
                             else:
-                                print("AE ready: comp created and opened.")
-                            print("Work in AE, then select the comp and run FxLink Export to overwrite the Output file — Resolve will pick it up.")
-                            if kind == "sequence":
-                                print("For a sequence, give FxLink Export an Output Module template named 'FxLink Sequence' that renders the same image format.")
-                        else:
-                            problem(f"Warning: AE setup failed: {ae_result}")
+                                clip = imported[0]
+                                clip_start_frame = 0
+                                if kind == "sequence":
+                                    # A sequence comes in at Resolve's default
+                                    # still-sequence rate, not the timeline's.
+                                    if not clip.SetClipProperty("FPS", str(fps)):
+                                        problem(f"Warning: could not set the sequence's frame rate to {fps}.")
+                                    # Sequence clips index from their file numbers.
+                                    try:
+                                        clip_start_frame = int(float(clip.GetClipProperty("Start") or 0))
+                                    except (TypeError, ValueError):
+                                        clip_start_frame = 0
 
-show_problems()
+                                clip_total_frames = int(clip.GetClipProperty("Frames"))
+                                frame_total = clip_total_frames
+                                record_frame = mark_in
+                                clip_end = mark_out + 1 if mark_out is not None else mark_in + clip_total_frames
+
+                                total_tracks = timeline.GetTrackCount("video")
+                                highest_occupied = 0
+                                for track_idx in range(1, total_tracks + 1):
+                                    items = timeline.GetItemListInTrack("video", track_idx) or []
+                                    if any(item.GetStart() < clip_end and item.GetEnd() > record_frame for item in items):
+                                        highest_occupied = track_idx
+
+                                target_track = highest_occupied + 1
+                                if target_track > total_tracks:
+                                    timeline.AddTrack("video")
+
+                                placed = media_pool.AppendToTimeline([{
+                                    "mediaPoolItem": clip,
+                                    "startFrame": clip_start_frame,
+                                    "endFrame": clip_start_frame + clip_total_frames,
+                                    "mediaType": 1,
+                                    "trackIndex": target_track,
+                                    "recordFrame": record_frame,
+                                }])
+
+                                timeline_item = placed[0] if placed else None
+                                if not timeline_item:
+                                    problem("Warning: Could not place clip onto timeline (note: placement inside compound clips is not supported by the API).")
+                                    print("The clip is in the FxLink bin — you can drag it manually.")
+                                else:
+                                    timeline_item.SetClipColor(CLIP_COLOR)
+                                    print(f"Placed on video track {target_track} at frame {record_frame} ({CLIP_COLOR}).")
+
+                                timeline.SetCurrentTimecode(playhead_tc)
+
+                            # --- Everything in Resolve is done; now set up the AE project ---
+                            # The comp's size and length come from the footage when
+                            # there is some; in audio-only mode, from the timeline.
+                            if frame_total is None and mark_in is not None and mark_out is not None:
+                                frame_total = mark_out - mark_in + 1
+                            try:
+                                width = int(float(timeline.GetSetting("timelineResolutionWidth") or 1920))
+                                height = int(float(timeline.GetSetting("timelineResolutionHeight") or 1080))
+                            except (TypeError, ValueError):
+                                width, height = 1920, 1080
+                            duration = (frame_total or 1) / float(fps)
+
+                            print("Setting up After Effects project...")
+                            setup_jsx = (SETUP_PROJECT_JSX
+                                         .replace("__SRC_FILE__", (render_path or "").replace("\\", "/"))
+                                         .replace("__AUDIO_FILE__", (audio_path or "").replace("\\", "/"))
+                                         .replace("__COMP_NAME__", final_name)
+                                         .replace("__IS_SEQUENCE__", "true" if (kind == "sequence" and render_path) else "false")
+                                         .replace("__FPS__", repr(float(fps)))
+                                         .replace("__WIDTH__", str(width))
+                                         .replace("__HEIGHT__", str(height))
+                                         .replace("__DURATION__", repr(duration)))
+                            ae_result = run_extendscript(afterfx_exe, setup_jsx, timeout=30)
+
+                            if ae_result is None:
+                                problem("Warning: AE did not confirm project setup (timeout). Check AE manually.")
+                            elif ae_result.startswith("OK"):
+                                if audio_only:
+                                    print("AE ready: comp created with the audio in it, no footage.")
+                                else:
+                                    print("AE ready: comp created and opened.")
+                                print("Work in AE, then select the comp and run FxLink Export to overwrite the Output file — Resolve will pick it up.")
+                                if kind == "sequence":
+                                    print("For a sequence, give FxLink Export an Output Module template named 'FxLink Sequence' that renders the same image format.")
+                            else:
+                                problem(f"Warning: AE setup failed: {ae_result}")
+
+# Run directly (Resolve's Scripts menu) it behaves exactly as it always has.
+# The FxLink Queue loads this file with FXLINK_AS_LIBRARY set, to call main()
+# once per queued range itself and collect the problems into one summary.
+if not globals().get("FXLINK_AS_LIBRARY"):
+    main()
+    show_problems()
