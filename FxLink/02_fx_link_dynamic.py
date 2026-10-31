@@ -88,11 +88,15 @@ def default_audio_preset(preset_names, last_audio_preset=None):
 
 
 def ask_options(preset_names, last_preset=None, last_mode=MODE_FOOTAGE,
-                last_audio_preset=None, parent=None, title="FxLink"):
+                last_audio_preset=None, parent=None, title="FxLink", target="After Effects"):
     """What to send to After Effects, and which presets to render it with.
 
     Returns (picture preset, mode, audio preset), or (None, None, None) if
     cancelled.
+
+    Motion Link uses this same window with target="Cavalry". There the footage
+    is imported as it is (a movie, never a sequence), and audio-only mode
+    renders nothing but the audio, so the picture preset isn't used for it.
 
     With a parent (the FxLink Queue window) it opens as a child window of it.
     Opening a second Tk() inside a running Tk app instead would bind this
@@ -110,8 +114,10 @@ def ask_options(preset_names, last_preset=None, last_mode=MODE_FOOTAGE,
                             else MODE_FOOTAGE)
     modes = tk.Frame(root, padx=12, pady=8)
     modes.pack(fill="x")
-    tk.Label(modes, text="Send to After Effects:", anchor="w").pack(fill="x")
-    tk.Radiobutton(modes, text="Footage  (image sequences also get their audio)",
+    for_ae = target == "After Effects"
+    tk.Label(modes, text=f"Send to {target}:", anchor="w").pack(fill="x")
+    tk.Radiobutton(modes, text="Footage  (image sequences also get their audio)" if for_ae
+                   else "Video  - imported as footage, with its audio if the preset has any",
                    variable=mode_var, value=MODE_FOOTAGE, anchor="w").pack(fill="x")
     tk.Radiobutton(modes, text="Audio only  - as a timing reference, no footage",
                    variable=mode_var, value=MODE_AUDIO, anchor="w").pack(fill="x")
@@ -139,6 +145,15 @@ def ask_options(preset_names, last_preset=None, last_mode=MODE_FOOTAGE,
     audio_combo.pack(padx=12, pady=4)
 
     def describe(*_args):
+        if not for_ae:
+            audio = mode_var.get() == MODE_AUDIO
+            combo.config(state="disabled" if audio else "readonly")
+            picture_label.config(text="Render Preset  (not used for audio only):" if audio
+                                 else "Render Preset:")
+            label.config(text="Only the audio preset renders." if audio else
+                         f"Use a movie preset (ProRes, H.264...) - {target} gets one\n"
+                         "file, so image sequence presets are refused.")
+            return
         # The picture preset still matters in audio-only mode - it sets the
         # format of what AE renders back - so say what it does in each mode.
         if mode_var.get() == MODE_AUDIO:

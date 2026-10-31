@@ -4,7 +4,8 @@
 //
 // Builds a Composition from a job file written by "Motion Link Export" in
 // DaVinci Resolve: frame rate, length and resolution matched to the timeline,
-// with the exported audio in it as a timing guide. Nothing goes back to Resolve.
+// with the exported audio or video in it as a reference. Nothing goes back to
+// Resolve.
 //
 // WHY A FILE AND NOT A LIVE CONNECTION
 //   Cavalry has no equivalent of After Effects' "AfterFX.exe -r script.jsx", so
@@ -54,7 +55,7 @@ var CAV = {
 };
 // ====================================================================
 
-var JOB_VERSION = 1;
+var JOB_VERSION = 2;    // 2: "media" (audio or video); version 1 audio jobs still build
 var FALLBACK_INBOX = "C:/Users/john-/AppData/Roaming/motion_link";
 
 function log(line) { console.log(line); }
@@ -93,20 +94,24 @@ function readJob(explicitPath) {
         log("  " + path);
         return null;
     }
-    if (job.motion_link_version !== JOB_VERSION) {
+    if (job.motion_link_version !== JOB_VERSION && job.motion_link_version !== 1) {
         // Refuse rather than half-build against a schema this script predates.
         log("This job was written by a different version of Motion Link "
             + "(job says " + job.motion_link_version + ", this script expects "
             + JOB_VERSION + "). Redeploy the scripts so both sides match.");
         return null;
     }
-    if (!job.audio || !job.audio.path) {
-        log("The job has no audio path in it.");
+    if (job.motion_link_version === 1 && job.audio) {
+        // Version 1 jobs were always audio, under "audio" rather than "media".
+        job.media = { path: job.audio.path, kind: "audio" };
+    }
+    if (!job.media || !job.media.path) {
+        log("The job has no media path in it.");
         return null;
     }
-    if (!api.filePathExists(job.audio.path)) {
-        log("The audio file named in the job is missing:");
-        log("  " + job.audio.path);
+    if (!api.filePathExists(job.media.path)) {
+        log("The " + job.media.kind + " file named in the job is missing:");
+        log("  " + job.media.path);
         log("  It may have been moved or renamed since the export. Re-export "
             + "from Resolve.");
         return null;
@@ -117,7 +122,7 @@ function readJob(explicitPath) {
     // in place, and rebuilding that silently would be indistinguishable from
     // success - so say out loud which export this is and how old it is.
     log("Job written : " + (job.created || "unknown time") + describeAge(job.created));
-    log("Audio file  : " + String(job.audio.path).split("/").pop());
+    log("Reference   : " + String(job.media.path).split("/").pop() + "  (" + job.media.kind + ")");
 
     return job;
 }
@@ -138,54 +143,43 @@ function describeAge(created) {
         + "export you meant)";
 }
 
-var ASSET_FOLDER = "MotionLink";     // where imported audio lands
+var ASSET_FOLDER = "MotionLink";     // where the imported audio/video lands
 var COMP_FOLDER = "_Outputs";        // where the Composition lands
 
-function folderIndexPath() {
-    return inboxDir() + "/folder_index.json";
+function findFolder(name) {
+    // Asset Window folders are layers of type "assetGroup", so they can be found
+    // by name in the scene itself. An earlier version remembered folder ids in
+    // folder_index.json instead; that cache went stale (undo, reverting the
+    // scene) and then made a second MotionLink / _Outputs beside your own.
+    // A top-level folder wins over a nested one of the same name.
+    var nested = null;
+    var all = [];
+    try { all = api.getAllSceneLayers() || []; } catch (e) { return null; }
+    for (var i = 0; i < all.length; i++) {
+        var id = all[i];
+        try {
+            if (api.getLayerType(id) !== "assetGroup" || api.getNiceName(id) !== name) {
+                continue;
+            }
+        } catch (e) { continue; }
+        var parent = "";
+        try { parent = api.getParent(id) || ""; } catch (e) { /* treat as top level */ }
+        if (!parent) { return id; }
+        if (!nested) { nested = id; }
+    }
+    return nested;
 }
 
 function findOrCreateFolder(name) {
-    // Cavalry can create an Assets Window group but offers no way to search for
-    // one by name, so the IDs are remembered between runs. An ID is only reused
-    // if it still reads back - a folder you deleted, or one belonging to another
-    // scene, is detected and replaced rather than parented into silently.
-    var scene = "";
-    try { scene = api.getSceneFilePath() || ""; } catch (e) { /* unsaved scene */ }
-    var key = scene + "|" + name;
-
-    var index = {};
-    try {
-        if (api.filePathExists(folderIndexPath())) {
-            index = JSON.parse(api.readFromFile(folderIndexPath())) || {};
-        }
-    } catch (e) { index = {}; }
-
-    var known = index[key];
-    if (known) {
-        var alive = false;
-        try {
-            var label = api.get(known, CAV.compNameAttr);
-            alive = (label !== undefined && label !== null && String(label) !== "");
-        } catch (e) { alive = false; }
-        if (alive) { return known; }
-        log("    (the remembered '" + name + "' folder is gone - making a new one)");
-    }
-
-    var folderId = null;
+    var folderId = findFolder(name);
+    if (folderId) { return folderId; }
     try {
         folderId = api.createAssetGroup(name);
     } catch (e) {
         log("  ! could not create the '" + name + "' folder: " + e);
         return null;
     }
-    if (!folderId) { return null; }
-
-    index[key] = folderId;
-    try {
-        api.writeToFile(folderIndexPath(), JSON.stringify(index, null, 2), true);
-    } catch (e) { /* losing the index only costs a duplicate folder next run */ }
-    return folderId;
+    return folderId || null;
 }
 
 function fileInto(layerId, folderName) {
@@ -270,22 +264,23 @@ function writeAttr(targetId, ids, wanted, label) {
     return null;
 }
 
-function attachAudio(job) {
+function attachMedia(job) {
     // Returns "wired" | "imported" | "failed".
     var assetId;
     try {
-        assetId = api.loadAsset(job.audio.path, false);
+        assetId = api.loadAsset(job.media.path, false);
     } catch (e) {
-        log("  could not load the audio asset: " + e);
+        log("  could not load the " + job.media.kind + " asset: " + e);
         return "failed";
     }
     if (!assetId) {
-        log("  loadAsset returned nothing for " + job.audio.path);
+        log("  loadAsset returned nothing for " + job.media.path);
         return "failed";
     }
-    log("  audio asset loaded: " + assetId);
+    log("  " + job.media.kind + " asset loaded: " + assetId);
     fileInto(assetId, ASSET_FOLDER);
 
+    // Video goes in the same way: addAssetToComp makes a footage layer of it.
     // addAssetToComp does the whole job for audio: it creates the Footage Shape
     // AND its own Sound behaviour, already wired and already playing. An earlier
     // version then added a second Sound behaviour of its own ("Motion Link
@@ -309,7 +304,7 @@ log("\n===== MOTION LINK =====");
 var job = readJob(jobPathOverride);
 if (!job) {
     log("===== nothing built =====\n");
-    return;
+    return false;
 }
 
 log("Job from Resolve timeline: " + job.resolve.timeline
@@ -325,12 +320,12 @@ try {
 } catch (e) {
     log("Could not create the Composition: " + e);
     log("===== nothing built =====\n");
-    return;
+    return false;
 }
 if (!compId) {
     log("createComp returned nothing - cannot continue.");
     log("===== nothing built =====\n");
-    return;
+    return false;
 }
 log("Created Composition: " + job.comp.name + "  [" + compId + "]");
 fileInto(compId, COMP_FOLDER);
@@ -374,8 +369,8 @@ log("    length: " + job.comp.duration_frames + " frames -> range "
     + start + " to " + end);
 apply("rangeEnd", end, "range end");
 
-log("\nAttaching audio:");
-var audioState = attachAudio(job);
+log("\nAttaching the " + job.media.kind + " reference:");
+var mediaState = attachMedia(job);
 
 // A receipt, so the Resolve panel can report what Cavalry last did without any
 // live connection between the two.
@@ -385,7 +380,7 @@ try {
         comp: job.comp.name,
         compId: compId,
         timeline: job.resolve.timeline,
-        audio: audioState,
+        media: mediaState,
         attributeMismatches: bad,
         // Which candidate IDs actually worked on this Cavalry version - so the
         // guessing only ever has to happen once.
@@ -398,7 +393,8 @@ log("Composition : " + job.comp.name);
 log("Size        : " + job.comp.width + " x " + job.comp.height);
 log("Frame rate  : " + job.comp.fps_string);
 log("Duration    : " + job.comp.duration_frames + " frames");
-log("Audio       : " + job.audio.path.split("/").pop() + "  (" + audioState + ")");
+log("Reference   : " + job.media.path.split("/").pop() + "  (" + job.media.kind + ", "
+    + mediaState + ")");
 log("Timing      : Cavalry frame 0 = Resolve frame " + job.range.mark_in
     + "  (" + job.range.in_timecode + ")");
 if (bad > 0) {
@@ -416,6 +412,61 @@ log("  - tick Play Audio on the Sound behaviour");
 log("");
 log("The scene has NOT been saved - that is deliberate, in case you were mid-edit.");
 log("===== END =====\n");
+return true;
+}
+
+function motionLinkBuildBatch() {
+    // Builds every Composition from the last "Export All" in the Motion Link
+    // Queue. The queue writes the list of job files to latest_batch.json; each
+    // one is built exactly as "Build Comp" would build it, one after another.
+    var path = motionLinkInbox() + "/latest_batch.json";
+    if (!api.filePathExists(path)) {
+        console.log("No Motion Link batch found.");
+        console.log("  Expected: " + path);
+        console.log("  Run 'Motion Link Queue' > Export All in DaVinci Resolve first.");
+        return;
+    }
+    var batch;
+    try {
+        batch = JSON.parse(api.readFromFile(path));
+    } catch (e) {
+        console.log("The batch file is not valid JSON (" + e + ").");
+        return;
+    }
+    if (!batch || batch.motion_link_batch_version !== 1 || !batch.jobs) {
+        console.log("The batch file was written by a different version of Motion "
+                    + "Link. Redeploy the scripts so both sides match.");
+        return;
+    }
+
+    console.log("\n===== MOTION LINK BATCH =====");
+    console.log("Exported " + (batch.created || "at an unknown time") + " from project '"
+                + batch.project + "' - " + batch.jobs.length + " Composition(s).");
+
+    var built = [], failed = [];
+    for (var i = 0; i < batch.jobs.length; i++) {
+        var name = String(batch.jobs[i]).split("/").pop();
+        console.log("\n[" + (i + 1) + " of " + batch.jobs.length + "] " + name);
+        var ok = false;
+        try {
+            ok = motionLinkBuild(batch.jobs[i]) === true;
+        } catch (e) {
+            console.log("  ! " + e);
+        }
+        (ok ? built : failed).push(name);
+    }
+
+    console.log("\n===== BATCH DONE =====");
+    console.log("Built " + built.length + " of " + batch.jobs.length + " Composition(s).");
+    if (failed.length) {
+        console.log("Not built (see above for why) - fix and redo each with "
+                    + "'Motion Link Build From File':");
+        for (var j = 0; j < failed.length; j++) {
+            console.log("  " + failed[j]);
+        }
+    }
+    console.log("Building the same batch twice makes duplicates - each run "
+                + "creates new Compositions.");
 }
 
 function motionLinkInbox() {
@@ -434,8 +485,9 @@ function motionLinkNewestFolder() {
         var latest = motionLinkInbox() + "/latest_job.json";
         if (api.filePathExists(latest)) {
             var job = JSON.parse(api.readFromFile(latest));
-            if (job && job.audio && job.audio.path) {
-                var p = String(job.audio.path);
+            var media = job && (job.media || job.audio);
+            if (media && media.path) {
+                var p = String(media.path);
                 return p.substring(0, p.lastIndexOf("/"));
             }
         }

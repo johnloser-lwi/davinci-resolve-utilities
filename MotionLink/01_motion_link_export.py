@@ -1,8 +1,8 @@
 import ctypes
 import json
 import os
+import glob
 import re
-import time
 import tkinter as tk
 import traceback
 from datetime import datetime
@@ -10,10 +10,14 @@ from tkinter import filedialog, ttk
 
 # Motion Link - hand a timeline's timing over to Cavalry.
 #
-# Renders the audio of the current range and writes a small job file describing
-# the timeline. The companion Cavalry script ("Motion Link Build Comp") reads
-# that job and builds a Composition with matching frame rate, length and
-# resolution, with the audio in it as a timing guide.
+# Renders the current range - its audio, or video, whichever you choose - and
+# writes a small job file describing the timeline. The companion Cavalry script
+# ("Motion Link Build Comp") reads that job and builds a Composition with
+# matching frame rate, length and resolution, with what you rendered in it as a
+# reference.
+#
+# The rendering is FxLink's own code (see "export pipeline" below), so both
+# tools pick presets the same way and share every render fix.
 #
 # Nothing comes back. This is deliberately one-way: Cavalry builds an element,
 # and the element gets composited in Fusion later.
@@ -42,7 +46,7 @@ for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
 
 PREFS_FILE = os.path.expandvars(r"%APPDATA%\motion_link_prefs.json")
 INBOX_DIR = os.path.expandvars(r"%APPDATA%\motion_link")
-JOB_VERSION = 1
+JOB_VERSION = 2     # 2: "media" (audio or video) replaces "audio"
 
 BG = "#1e1e1e"
 PANEL = "#252525"
@@ -59,15 +63,6 @@ SCALE_CHOICES = ["Auto", "100%", "125%", "150%", "175%", "200%", "250%"]
 SCALE = 1.0
 
 RANGE_MODES = ["In / Out", "Whole timeline"]
-QUALITY_CHOICES = ["WAV 24-bit 48 kHz", "WAV 16-bit 48 kHz", "WAV 24-bit 96 kHz"]
-QUALITY_SETTINGS = {
-    "WAV 24-bit 48 kHz": (24, 48000),
-    "WAV 16-bit 48 kHz": (16, 48000),
-    "WAV 24-bit 96 kHz": (24, 96000),
-}
-# Formats Resolve may report for plain PCM audio, best first.
-WAV_FORMAT_HINTS = ("wav", "wave")
-WAV_CODEC_HINTS = ("lpcm", "linearpcm", "pcm")
 
 
 def S(n):
@@ -214,78 +209,22 @@ def timeline_facts(timeline):
     }
 
 
-def wav_format_and_codec(project):
-    """Resolve's WAV audio format and codec. Returns (extension, codec) or None.
+def next_numbered_name(folder, base, taken=()):
+    """<base>001, incrementing past whatever is already in the folder.
 
-    Uses GetAudioRenderFormats, NOT GetRenderFormats. They are different lists:
-    the plain one holds video formats (mp4, mov...) and has no wav in it at all,
-    so searching it found nothing and the render fell back to whatever the
-    Deliver page was last set to - which is how this ended up producing an mp4.
-
-    Both dicts are {description -> file extension}, and AudioFormat wants the
-    extension.
+    taken: stems already claimed by earlier jobs in the same batch. Their files
+    don't exist until the batch renders, so without this every range in a
+    batch would be given the same number.
     """
-    formats = {}
-    for getter in ("GetAudioRenderFormats", "GetRenderFormats"):
-        try:
-            formats = getattr(project, getter)() or {}
-        except Exception as e:
-            print(f"{getter} failed: {e}")
-            continue
-        if formats:
-            print(f"{getter}: {formats}")
-            break
-    if not formats:
-        return None, None
-
-    ext = None
-    for value in formats.values():
-        if str(value).lower() in WAV_FORMAT_HINTS:
-            ext = str(value)
-            break
-    if ext is None:
-        for name, value in formats.items():
-            if "wav" in str(name).lower():
-                ext = str(value)
-                break
-    if ext is None:
-        return None, None
-
-    codecs = {}
-    for getter in ("GetAudioRenderCodecs", "GetRenderCodecs"):
-        try:
-            codecs = getattr(project, getter)(ext) or {}
-        except Exception:
-            continue
-        if codecs:
-            break
-    codec = None
-    for value in codecs.values():
-        if str(value).lower() in WAV_CODEC_HINTS:
-            codec = str(value)
-            break
-    if codec is None and codecs:
-        codec = str(next(iter(codecs.values())))
-
-    # Deliberately NOT reading the format back from
-    # GetCurrentRenderFormatAndCodec here. An earlier version did, and because
-    # it ran even when nothing had been set, it overwrote the wav choice with
-    # the Deliver page's current video format - the second reason this rendered
-    # an mp4. ExportVideo=False plus AudioFormat is what decides the output.
-    return ext, codec
-
-
-def next_numbered_name(folder, base):
-    """<base>001, incrementing past whatever is already in the folder."""
-    highest = 0
     try:
-        for entry in os.listdir(folder):
-            stem = os.path.splitext(entry)[0]
-            match = re.fullmatch(re.escape(base) + r"(\d+)", stem)
-            if match:
-                highest = max(highest, int(match.group(1)))
+        names = [os.path.splitext(entry)[0] for entry in os.listdir(folder)]
     except OSError:
-        pass
+        names = []
+    highest = 0
+    for stem in names + list(taken):
+        match = re.fullmatch(re.escape(base) + r"(\d+)", stem)
+        if match:
+            highest = max(highest, int(match.group(1)))
     return f"{base}{highest + 1:03d}"
 
 
@@ -293,11 +232,238 @@ def find_output(folder, stem):
     """The rendered file, whatever extension Resolve chose to give it."""
     try:
         for entry in os.listdir(folder):
-            if os.path.splitext(entry)[0] == stem:
+            name, ext = os.path.splitext(entry)
+            if name == stem and ext.lower() != ".json":      # not our own job file
                 return os.path.join(folder, entry)
     except OSError:
         pass
     return None
+
+
+# --------------------------------------------------------------------------
+# export pipeline - shared by this panel and the Motion Link Queue
+# --------------------------------------------------------------------------
+#
+# The render is FxLink's: its dynamic-link script is loaded as a library and its
+# settings window, preset handling and render monitoring are used as they are.
+# Motion Link only adds the job file that Cavalry reads.
+#
+# Every render loads a preset first. An earlier version instead switched audio
+# settings on whatever the Deliver page had loaded - after an FxLink run that
+# was a TIFF sequence, which can't produce audio, so the render sometimes never
+# started. FxLink had already been through exactly that.
+
+MODE_VIDEO = "footage"      # FxLink's mode names, so its settings window is shared
+MODE_AUDIO = "audio"
+FXLINK_SCRIPT = "02_fx_link_dynamic.py"
+RESOLVE_SCRIPTS = os.path.expandvars(
+    r"%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility")
+_FX = None
+
+
+class ExportError(Exception):
+    """A problem worded for the user."""
+
+
+def find_fxlink_script():
+    candidates = []
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(os.path.dirname(here), "FxLink", FXLINK_SCRIPT))
+    except NameError:
+        pass                                    # some embedded runners have no __file__
+    candidates.append(os.path.join(RESOLVE_SCRIPTS, "John", "FxLink", FXLINK_SCRIPT))
+    candidates += glob.glob(os.path.join(RESOLVE_SCRIPTS, "**", "*fx_link_dynamic.py"),
+                            recursive=True)
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def fxlink():
+    """FxLink's functions, loaded once, without running FxLink."""
+    global _FX
+    if _FX is None:
+        path = find_fxlink_script()
+        if not path:
+            raise ExportError(f"Motion Link renders with FxLink's code and couldn't find "
+                              f"{FXLINK_SCRIPT}. Run deploy.ps1.")
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        ns = {"bmd": bmd, "__name__": "fxlink_dynamic", "__file__": path,
+              "FXLINK_AS_LIBRARY": True}
+        exec(compile(source, path, "exec"), ns)
+        if "run_render" not in ns or "target" not in ns["ask_options"].__code__.co_varnames:
+            raise ExportError(f"{os.path.basename(path)} is an older version - run deploy.ps1 "
+                              f"so FxLink and Motion Link match.")
+        _FX = ns
+    return _FX
+
+
+def preset_names(project):
+    presets = project.GetRenderPresets() or {}
+    if isinstance(presets, dict):
+        return [presets[k] for k in sorted(presets.keys())]
+    return list(presets)
+
+
+def ask_settings(project, last=None, parent=None, title="Motion Link"):
+    """FxLink's settings window, worded for Cavalry.
+
+    Returns {"mode", "preset", "audio_preset"}, or None if cancelled.
+    """
+    names = preset_names(project)
+    if not names:
+        raise ExportError("No render presets in this project - make one on the Deliver page.")
+    last = last or {}
+    preset, mode, audio_preset = fxlink()["ask_options"](
+        names, last_preset=last.get("preset"), last_mode=last.get("mode", MODE_AUDIO),
+        last_audio_preset=last.get("audio_preset"), parent=parent, title=title,
+        target="Cavalry")
+    if not mode:
+        return None
+    return {"mode": mode, "preset": preset, "audio_preset": audio_preset}
+
+
+def describe_settings(settings):
+    if not settings:
+        return "not chosen yet"
+    if settings.get("mode") == MODE_AUDIO:
+        return f"Audio only  ·  {settings.get('audio_preset')}"
+    return f"Video  ·  {settings.get('preset')}"
+
+
+def export_range(project, timeline, dest, settings, whole, comp_name=None):
+    """Render the timeline's In/Out (or all of it) and write the job for Cavalry.
+
+    settings comes from ask_settings. Returns (sidecar path, job dict); raises
+    ExportError with a message for the user.
+    """
+    fx = fxlink()
+    facts = timeline_facts(timeline)
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as e:
+        raise ExportError(f"Cannot use that destination: {e}")
+
+    audio = (settings or {}).get("mode") == MODE_AUDIO
+    preset = (settings or {}).get("audio_preset" if audio else "preset")
+    if not preset:
+        raise ExportError("No render preset chosen - set the render settings first.")
+    if not project.LoadRenderPreset(preset):
+        raise ExportError(f"Couldn't load the '{preset}' render preset.")
+    if not audio and fx["loaded_preset_is_sequence"](project):
+        raise ExportError(f"'{preset}' renders an image sequence. Cavalry gets one file - "
+                          f"pick a movie preset (ProRes, H.264...).")
+
+    stem = next_numbered_name(dest, f"{sanitise(facts['name'])}_MotionLink_")
+    print(f"Rendering {'audio' if audio else 'video'} with '{preset}': {stem} -> {dest}")
+    fx["PROBLEMS"].clear()
+    try:
+        _job_id, mark_in, mark_out = fx["run_render"](
+            project, {"SelectAllFrames": whole, "TargetDir": dest, "CustomName": stem},
+            label="audio" if audio else "video")
+    except RuntimeError as e:
+        raise ExportError(str(e))
+    for note in fx["PROBLEMS"]:
+        print(note)
+
+    media_path = find_output(dest, stem)
+    if not media_path:
+        raise ExportError(f"The render finished but no file named '{stem}' turned up in {dest}.")
+    # Check the preset made what was asked for, rather than handing Cavalry a
+    # video file as the "audio" or the other way round.
+    is_audio_file = os.path.splitext(media_path)[1].lower() in fx["AUDIO_EXTS"]
+    if audio and not is_audio_file:
+        raise ExportError(f"The '{preset}' preset rendered '{os.path.basename(media_path)}', "
+                          f"which isn't an audio file. {fx['AUDIO_PRESET_HOWTO']}")
+    if not audio and is_audio_file:
+        raise ExportError(f"The '{preset}' preset only rendered audio. Choose Audio only, "
+                          f"or a preset that exports video.")
+
+    if mark_in is None or mark_out is None:
+        mark_in = facts["start_frame"]
+        mark_out = facts["end_frame"] - 1
+        print("Render job did not report MarkIn/MarkOut; "
+              f"falling back to the whole timeline ({mark_in}-{mark_out}).")
+    mark_in, mark_out = int(mark_in), int(mark_out)
+    duration = mark_out - mark_in + 1
+
+    job = {
+        "motion_link_version": JOB_VERSION,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "resolve": {
+            "project": project.GetName(),
+            "timeline": facts["name"],
+            "timeline_start_frame": facts["start_frame"],
+            "timeline_start_timecode": frame_to_tc(facts["start_frame"],
+                                                   facts["fps"], facts["drop_frame"]),
+            "drop_frame": facts["drop_frame"],
+        },
+        "comp": {
+            # An untouched Comp name tracks the export name, so the Composition
+            # in Cavalry and the file on disk are called the same thing.
+            "name": sanitise(comp_name) if comp_name and sanitise(comp_name) else stem,
+            "fps": facts["fps"],
+            # Kept alongside the float in case Cavalry's frame rate turns
+            # out to be an enum of named rates rather than a number.
+            "fps_string": facts["fps_string"],
+            "width": facts["width"],
+            "height": facts["height"],
+            "duration_frames": duration,
+            "start_frame": 0,
+        },
+        "range": {
+            "mode": "whole" if whole else "in_out",
+            "mark_in": mark_in,
+            "mark_out": mark_out,
+            "in_timecode": frame_to_tc(mark_in, facts["fps"], facts["drop_frame"]),
+            "out_timecode": frame_to_tc(mark_out, facts["fps"], facts["drop_frame"]),
+        },
+        "media": {
+            # Forward slashes throughout so the Cavalry side never has to
+            # deal with backslash escapes.
+            "path": media_path.replace("\\", "/"),
+            "kind": "audio" if audio else "video",
+            "preset": preset,
+            "offset_frames": 0,
+        },
+    }
+
+    sidecar = os.path.join(dest, stem + ".json")
+    for path in (sidecar, os.path.join(INBOX_DIR, "latest_job.json")):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(job, f, indent=2)
+        except OSError as e:
+            print(f"Could not write {path}: {e}")
+            # The fixed-path copy is the one Cavalry reads; without it the
+            # handoff is broken even though the render went fine.
+            raise ExportError("Rendered, but the job file for Cavalry could not be "
+                              "written - see the console.")
+
+    print(f"\nMedia : {media_path}")
+    print(f"Comp  : {job['comp']['name']}  {facts['width']}x{facts['height']}  "
+          f"{facts['fps_string']} fps  {duration} frames")
+    print(f"Timing: Cavalry frame 0 = Resolve frame {mark_in} "
+          f"({job['range']['in_timecode']})")
+    return sidecar, job
+
+
+def write_batch(project_name, sidecars):
+    """%APPDATA%\\motion_link\\latest_batch.json - what "Build Batch" reads."""
+    path = os.path.join(INBOX_DIR, "latest_batch.json")
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "motion_link_batch_version": 1,
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "project": project_name,
+            "jobs": [p.replace("\\", "/") for p in sidecars],
+        }, f, indent=2)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -411,13 +577,13 @@ class MotionLink:
                  ).grid(row=2, column=1, sticky="ew", ipady=S(3), pady=(0, S(8)))
         self._name_edited = False
 
-        label("Audio", 3)
-        self.quality_var = tk.StringVar(
-            value=self.prefs.get("audio_quality", QUALITY_CHOICES[0]))
-        quality = ttk.Combobox(form, textvariable=self.quality_var, values=QUALITY_CHOICES,
-                               state="readonly", width=22, font=FONT(9))
-        quality.grid(row=3, column=1, sticky="w", pady=(0, S(8)))
-        quality.bind("<<ComboboxSelected>>", self.on_quality_change)
+        label("Render", 3)
+        render_row = tk.Frame(form, bg=BG)
+        render_row.grid(row=3, column=1, sticky="ew", pady=(0, S(8)))
+        self.render_label = tk.Label(render_row, bg=BG, fg=FG, anchor="w", font=FONT(9),
+                                     text=describe_settings(self.prefs.get("render_settings")))
+        self.render_label.pack(side="left")
+        make_button(render_row, "Settings", self.choose_settings).pack(side="right")
 
         action = tk.Frame(content, bg=BG)
         action.pack(fill="x", padx=S(14), pady=(S(6), 0))
@@ -427,10 +593,10 @@ class MotionLink:
         self.result = tk.Label(action, text="", bg=BG, fg=SUB, anchor="w", font=FONT(9))
         self.result.pack(side="left", padx=(S(12), 0))
 
-        tk.Label(content, text="Renders the range as a WAV and writes a job file "
-                               "next to it. In Cavalry, run Window > Scripts > John "
+        tk.Label(content, text="Renders the range - audio or video, as set in "
+                               "Settings - and writes a job file next to it. In Cavalry, run Window > Scripts > John "
                                "> Motion Link Build Comp to build a matching "
-                               "Composition with the audio in it.\n"
+                               "Composition with that render in it.\n"
                                "Nothing comes back from Cavalry - render your element "
                                "there and bring it into Fusion yourself.",
                  bg=BG, fg=SUB, font=FONT(8), anchor="w", justify="left",
@@ -474,14 +640,22 @@ class MotionLink:
         self.prefs["range_mode"] = self.range_var.get()
         save_prefs(self.prefs)
 
-    def on_quality_change(self, event=None):
-        if event and getattr(event, "widget", None):
-            try:
-                event.widget.selection_clear()
-            except Exception:
-                pass
-        self.prefs["audio_quality"] = self.quality_var.get()
-        save_prefs(self.prefs)
+    def choose_settings(self):
+        """FxLink's settings window: Video or Audio only, and the presets."""
+        project = current_project()
+        if not project:
+            return None
+        try:
+            chosen = ask_settings(project, self.prefs.get("render_settings"),
+                                  parent=self.root, title="Motion Link - render settings")
+        except ExportError as e:
+            self.say(str(e), True)
+            return None
+        if chosen:
+            self.prefs["render_settings"] = chosen
+            save_prefs(self.prefs)
+            self.render_label.config(text=describe_settings(chosen))
+        return chosen
 
     def on_scale_change(self, event=None):
         global SCALE
@@ -606,170 +780,31 @@ class MotionLink:
             self.say("No timeline open.", True)
             return
 
-        self.facts = timeline_facts(timeline)
-        facts = self.facts
-
         dest = self.dest_var.get().strip()
         if not dest:
             self.say("Pick a destination folder first.", True)
             return
+        settings = self.prefs.get("render_settings") or self.choose_settings()
+        if not settings:
+            self.say("Choose the render settings first.", True)
+            return
+
+        self.say("Rendering...")
         try:
-            os.makedirs(dest, exist_ok=True)
-        except OSError as e:
-            self.say(f"Cannot use that destination: {e}", True)
+            sidecar, job = export_range(
+                project, timeline, dest, settings,
+                whole=self.range_var.get() == RANGE_MODES[1],
+                comp_name=self.comp_var.get() if self._name_edited else None)
+        except ExportError as e:
+            self.say(str(e), True)
             return
 
-
-        self.say("Finding the WAV render format...")
-        wav_fmt, wav_codec = wav_format_and_codec(project)
-        if not wav_fmt:
-            # Better to stop than to render whatever the Deliver page had set,
-            # which would quietly produce a video file.
-            self.say("Resolve reports no WAV render format - cannot export audio.", True)
-            return
-        print(f"Audio render format: {wav_fmt} / {wav_codec}")
-
-        bit_depth, sample_rate = QUALITY_SETTINGS.get(self.quality_var.get(), (24, 48000))
-        base = f"{sanitise(facts['name'])}_MotionLink_"
-        stem = next_numbered_name(dest, base)
-        # An untouched Comp name tracks the export name, so the Composition in
-        # Cavalry and the .wav on disk are called the same thing.
-        comp_name = stem if not self._name_edited else (
-            sanitise(self.comp_var.get()) or stem)
-        whole = self.range_var.get() == RANGE_MODES[1]
-
-        settings = {
-            # SelectAllFrames False means "use the timeline's In/Out".
-            "SelectAllFrames": whole,
-            "TargetDir": dest,
-            "CustomName": stem,
-            "ExportVideo": False,
-            "ExportAudio": True,
-            # AudioFormat is only honoured when ExportVideo is False.
-            "AudioFormat": wav_fmt,
-            "AudioBitDepth": bit_depth,
-            "AudioSampleRate": sample_rate,
-        }
-        if wav_codec:
-            settings["AudioCodec"] = wav_codec
-        if not project.SetRenderSettings(settings):
-            print("Warning: SetRenderSettings reported failure; continuing anyway.")
-
-        job_id = project.AddRenderJob()
-        if not job_id:
-            self.say("Resolve would not create a render job. With 'In / Out' "
-                     "selected, set an In and Out point on the timeline first.", True)
-            return
-
-        # Read the range back off the job rather than assuming a coordinate
-        # space: MarkIn may be absolute timeline frames or an offset, and this
-        # sidesteps the question entirely.
-        jobs = project.GetRenderJobList() or []
-        details = next((j for j in jobs if j.get("JobId") == job_id), {})
-        mark_in = details.get("MarkIn")
-        mark_out = details.get("MarkOut")
-        if mark_in is None or mark_out is None:
-            mark_in = facts["start_frame"]
-            mark_out = facts["end_frame"] - 1
-            print("Render job did not report MarkIn/MarkOut; "
-                  f"falling back to the whole timeline ({mark_in}-{mark_out}).")
-        duration = int(mark_out) - int(mark_in) + 1
-
-        self.say(f"Rendering {duration} frames of audio...")
-        print(f"Rendering audio: {stem} -> {dest}  (frames {mark_in}-{mark_out})")
-        project.StartRendering(job_id)
-        while project.IsRenderingInProgress():
-            time.sleep(0.5)
-
-        status = (project.GetRenderJobStatus(job_id) or {}).get("JobStatus", "Unknown")
-        if status != "Complete":
-            self.say(f"Render did not finish (status: {status}).", True)
-            return
-
-        audio_path = find_output(dest, stem)
-        if not audio_path:
-            self.say(f"Render finished but no file named '{stem}' turned up in "
-                     f"{dest}.", True)
-            return
-
-        # Resolve can quietly ignore the audio-only settings and render whatever
-        # the Deliver page had loaded. Catch that here rather than handing
-        # Cavalry a video file and calling it a reference track.
-        produced = os.path.splitext(audio_path)[1].lstrip(".").lower()
-        if produced != str(wav_fmt).lower():
-            print(f"Warning: asked for .{wav_fmt} but Resolve produced .{produced}")
-            self.say(f"Resolve rendered a .{produced}, not a .{wav_fmt}. Check the "
-                     f"Deliver page - the file is at {audio_path}", True)
-            return
-
-        job = {
-            "motion_link_version": JOB_VERSION,
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "resolve": {
-                "project": project.GetName(),
-                "timeline": facts["name"],
-                "timeline_start_frame": facts["start_frame"],
-                "timeline_start_timecode": frame_to_tc(facts["start_frame"],
-                                                       facts["fps"], facts["drop_frame"]),
-                "drop_frame": facts["drop_frame"],
-            },
-            "comp": {
-                "name": comp_name,
-                "fps": facts["fps"],
-                # Kept alongside the float in case Cavalry's frame rate turns
-                # out to be an enum of named rates rather than a number.
-                "fps_string": facts["fps_string"],
-                "width": facts["width"],
-                "height": facts["height"],
-                "duration_frames": duration,
-                "start_frame": 0,
-            },
-            "range": {
-                "mode": "whole" if whole else "in_out",
-                "mark_in": int(mark_in),
-                "mark_out": int(mark_out),
-                "in_timecode": frame_to_tc(int(mark_in), facts["fps"], facts["drop_frame"]),
-                "out_timecode": frame_to_tc(int(mark_out), facts["fps"], facts["drop_frame"]),
-            },
-            "audio": {
-                # Forward slashes throughout so the Cavalry side never has to
-                # deal with backslash escapes.
-                "path": audio_path.replace("\\", "/"),
-                "format": str(wav_fmt),
-                "codec": str(wav_codec or ""),
-                "bit_depth": bit_depth,
-                "sample_rate": sample_rate,
-                "offset_frames": 0,
-            },
-        }
-
-        sidecar = os.path.join(dest, stem + ".json")
-        written = []
-        for path in (sidecar, os.path.join(INBOX_DIR, "latest_job.json")):
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(job, f, indent=2)
-                written.append(path)
-            except OSError as e:
-                print(f"Could not write {path}: {e}")
-
-        if len(written) < 2:
-            # The fixed-path copy is the one Cavalry reads; without it the
-            # handoff is broken even though the audio rendered fine.
-            self.say("Audio rendered, but the job file for Cavalry could not be "
-                     "written - see the console.", True)
-            return
-
+        self.facts = timeline_facts(timeline)
         self._remember_dest()
-        self.result.config(text=f"{os.path.basename(audio_path)}  ·  {duration} frames")
+        self._sync_comp_name()
+        self.result.config(text=f"{os.path.basename(job['media']['path'])}  ·  "
+                                f"{job['comp']['duration_frames']} frames")
         self.say("Done. In Cavalry: Window > Scripts > John > Motion Link Build Comp.")
-        print(f"\nAudio : {audio_path}")
-        print(f"Job   : {written[1]}")
-        print(f"Comp  : {comp_name}  {facts['width']}x{facts['height']}  "
-              f"{facts['fps_string']} fps  {duration} frames")
-        print(f"Timing: Cavalry frame 0 = Resolve frame {mark_in} "
-              f"({job['range']['in_timecode']})")
 
     def _on_close(self):
         try:
@@ -813,13 +848,16 @@ def default_destination():
     return home if os.path.isdir(home) else ""
 
 
-prefs = load_prefs()
-root = tk.Tk()
-SCALE = resolve_scale(prefs, root)
-app = MotionLink(root)
-root.bind("<Escape>", lambda e: app._on_close())
-root.lift()
-root.attributes("-topmost", True)
-if not prefs.get("always_on_top", False):
-    root.after(300, lambda: root.attributes("-topmost", False))
-root.mainloop()
+# Run from the Scripts menu it opens the panel. The Motion Link Queue loads
+# this file with MOTION_LINK_AS_LIBRARY set, to use the export pipeline above.
+if not globals().get("MOTION_LINK_AS_LIBRARY"):
+    prefs = load_prefs()
+    root = tk.Tk()
+    SCALE = resolve_scale(prefs, root)
+    app = MotionLink(root)
+    root.bind("<Escape>", lambda e: app._on_close())
+    root.lift()
+    root.attributes("-topmost", True)
+    if not prefs.get("always_on_top", False):
+        root.after(300, lambda: root.attributes("-topmost", False))
+    root.mainloop()
