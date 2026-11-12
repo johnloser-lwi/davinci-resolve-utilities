@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from tkinter import messagebox, ttk
 
@@ -1044,7 +1045,12 @@ class FusionClipboard:
                              insertbackground=FG, font=FONT(9), padx=S(6), pady=S(5),
                              wrap="word", highlightthickness=1, highlightbackground=BORDER)
         self.notes.pack(fill="both", expand=True, pady=(S(4), S(6)))
-        self.notes.bind("<KeyRelease>", lambda e: setattr(self, "_notes_dirty", True))
+        self.notes.bind("<KeyRelease>", self._on_notes_key)
+        # Web links in notes are clickable (e.g. the source page of a preset).
+        self.notes.tag_configure("link", foreground=ACCENT_HOVER, underline=True)
+        self.notes.tag_bind("link", "<Enter>", lambda e: self.notes.config(cursor="hand2"))
+        self.notes.tag_bind("link", "<Leave>", lambda e: self.notes.config(cursor="xterm"))
+        self.notes.tag_bind("link", "<Button-1>", self._open_link)
         make_button(right, "Save Notes", self.save_notes).pack(fill="x")
 
         # actions
@@ -1206,8 +1212,26 @@ class FusionClipboard:
         self.detail_meta.config(text="\n".join(bits))
         self.notes.delete("1.0", "end")
         self.notes.insert("1.0", meta.get("notes", ""))
+        self._mark_links()
         self.fav_btn.config(text="★ Favorited" if meta.get("favorite") else "☆ Favorite")
         self._notes_dirty = False
+
+    def _on_notes_key(self, event=None):
+        self._notes_dirty = True
+        self._mark_links()
+
+    def _mark_links(self):
+        self.notes.tag_remove("link", "1.0", "end")
+        text = self.notes.get("1.0", "end-1c")
+        for match in re.finditer(r"https?://[^\s<>\"')\]]+", text):
+            self.notes.tag_add("link", f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+
+    def _open_link(self, event):
+        index = self.notes.index(f"@{event.x},{event.y}")
+        span = self.notes.tag_prevrange("link", index + "+1c")
+        if span and self.notes.compare(span[0], "<=", index) and self.notes.compare(index, "<", span[1]):
+            webbrowser.open(self.notes.get(*span))
+        return "break"
 
     # -- actions ----------------------------------------------------------
     def save_selection(self):

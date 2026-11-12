@@ -32,7 +32,10 @@ if (-not (Test-Path $dest)) {
     }
 }
 
-$scripts = Get-ChildItem -Path $source -Recurse -Filter "*.py"
+# Only scripts inside a tool folder are Resolve menu entries; .py files at the
+# repo root (migrate_prefs.py) are command-line tools run with plain Python.
+$scripts = Get-ChildItem -Path $source -Recurse -Filter "*.py" |
+    Where-Object { $_.DirectoryName -ne $source }
 
 if ($scripts.Count -eq 0) {
     Write-Host "No .py scripts found in $source"
