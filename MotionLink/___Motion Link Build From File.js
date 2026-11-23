@@ -11,20 +11,25 @@
 (function () {
 
     function inbox() {
-        try {
-            var home = api.getHomeFolder();
-            if (home) {
-                return String(home).replace(/\\/g, "/") + "/AppData/Roaming/motion_link";
-            }
-        } catch (e) { /* fall through */ }
-        return "C:/Users/john-/AppData/Roaming/motion_link";
+        // The folder deploy puts motion_link_core.js in - the same folder
+        // Resolve's Motion Link Export writes its jobs to:
+        //   Mac      ~/Library/Application Support/ResolveUtilities/motion_link
+        //   Windows  %APPDATA%\motion_link
+        var home = "";
+        try { home = String(api.getHomeFolder() || "").replace(/\\/g, "/"); } catch (e) { /* none */ }
+        var places = [home + "/Library/Application Support/ResolveUtilities/motion_link",
+                      home + "/AppData/Roaming/motion_link"];
+        for (var i = 0; i < places.length; i++) {
+            if (api.filePathExists(places[i] + "/motion_link_core.js")) { return places[i]; }
+        }
+        return places[0];
     }
 
     var corePath = inbox() + "/motion_link_core.js";
     if (!api.filePathExists(corePath)) {
         console.log("Motion Link: the shared core is missing.");
         console.log("  Expected: " + corePath);
-        console.log("  Run deploy.ps1 from the davinci-resolve-utilities repo.");
+        console.log("  Run deploy.sh (Mac) / deploy.ps1 (Windows) from the davinci-resolve-utilities repo.");
         return;
     }
 
@@ -37,7 +42,7 @@
 
     if (typeof motionLinkBuild !== "function" || typeof motionLinkPickJob !== "function") {
         console.log("Motion Link: the core loaded but its functions are missing "
-                    + "- the file is probably truncated. Re-run deploy.ps1.");
+                    + "- the file is probably truncated. Re-run the deploy script.");
         return;
     }
 

@@ -1,5 +1,15 @@
-import json
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "Utility/03_color_multicam_by_angle.py")     # Mac: opens the window in its own Python
+
 import tkinter as tk
 from tkinter import ttk
 
@@ -9,7 +19,7 @@ from tkinter import ttk
 # clip, so the angle-to-color mapping is chosen in a small dialog and
 # remembered per angle name in prefs.
 
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\multicam_color_prefs.json")
+PREFS_FILE = ru.data_path("multicam_color_prefs.json")
 SKIP = "— leave as is —"
 
 CLIP_COLORS = [
@@ -22,15 +32,11 @@ DEFAULT_CYCLE = ["Orange", "Blue", "Green", "Purple", "Yellow", "Teal", "Pink", 
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        with open(PREFS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
-        json.dump(prefs, f, indent=2)
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def ask_angle_colors(angle_names, prefs):

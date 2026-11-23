@@ -1,8 +1,16 @@
-import ctypes
-import datetime
-import glob
-import json
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "FxLink/04_fx_link_render_queue.py")     # Mac: opens the window in its own Python
+
+import datetime
 import traceback
 import uuid
 import tkinter as tk
@@ -25,21 +33,9 @@ from tkinter import messagebox, ttk
 # dynamic-link script itself and runs its main() once per range, so a fix there
 # is a fix here - two copies would drift apart.
 
-for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
-                        ("shcore", "SetProcessDpiAwareness", 1),
-                        ("user32", "SetProcessDPIAware", None)):
-    try:
-        _f = getattr(getattr(ctypes.windll, _mod), _fn)
-        _f(_arg) if _arg is not None else _f()
-        break
-    except Exception:
-        continue
-
-QUEUE_FILE = os.path.expandvars(r"%APPDATA%\fxlink_queue.json")
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\fxlink_queue_prefs.json")
+QUEUE_FILE = ru.data_path("fxlink_queue.json")
+PREFS_FILE = ru.data_path("fxlink_queue_prefs.json")
 DYNAMIC_SCRIPT = "02_fx_link_dynamic.py"
-RESOLVE_SCRIPTS = os.path.expandvars(
-    r"%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility")
 
 BG = "#1e1e1e"
 PANEL = "#252525"
@@ -62,26 +58,11 @@ def S(n):
 
 
 def FONT(size, weight=None):
-    pts = max(6, int(round(size * SCALE)))
-    return ("Segoe UI", pts, weight) if weight else ("Segoe UI", pts)
+    return ru.font(size, weight, SCALE)
 
 
 def detect_scale(root):
-    try:
-        dpi = root.winfo_fpixels("1i")
-    except Exception:
-        dpi = 96.0
-    scale = dpi / 96.0
-    if scale < 1.05:
-        try:
-            width = root.winfo_screenwidth()
-        except Exception:
-            width = 1920
-        if width >= 3400:
-            scale = 1.5
-        elif width >= 2800:
-            scale = 1.25
-    return max(1.0, min(scale, 3.0))
+    return ru.detect_scale(root)
 
 
 def resolve_scale(prefs, root):
@@ -95,27 +76,17 @@ def resolve_scale(prefs, root):
 
 
 def read_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default
+    return ru.read_json(path, default)
 
 
 def write_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"Could not save {os.path.basename(path)}: {e}")
+    ru.write_json(path, data)
 
 
 def make_button(parent, text, command, primary=False):
     base = ACCENT if primary else BTN
     hover = ACCENT_HOVER if primary else BTN_HOVER
-    btn = tk.Button(parent, text=text, command=command, bg=base,
+    btn = ru.Button(parent, text=text, command=command, bg=base,
                     fg="#ffffff" if primary else FG, relief="flat", bd=0,
                     padx=S(12), pady=S(6), font=FONT(9), cursor="hand2",
                     activebackground=hover, activeforeground=FG,
@@ -146,35 +117,12 @@ def frame_to_tc(frame, fps, drop_frame):
 # the dynamic-link script, loaded as a library
 # --------------------------------------------------------------------------
 
-def find_dynamic_script():
-    """The deployed FxLink dynamic-link script, wherever it is."""
-    candidates = []
-    try:
-        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), DYNAMIC_SCRIPT))
-    except NameError:
-        pass                                    # some embedded runners have no __file__
-    candidates.append(os.path.join(RESOLVE_SCRIPTS, "John", "FxLink", DYNAMIC_SCRIPT))
-    candidates += glob.glob(os.path.join(RESOLVE_SCRIPTS, "**", "*fx_link_dynamic.py"),
-                            recursive=True)
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
 def load_fxlink():
     """The dynamic-link script's functions, without running it."""
-    path = find_dynamic_script()
-    if not path:
-        raise RuntimeError(f"Couldn't find {DYNAMIC_SCRIPT}. Run deploy.ps1.")
-    with open(path, "r", encoding="utf-8") as f:
-        source = f.read()
-    ns = {"bmd": bmd, "__name__": "fxlink_dynamic", "__file__": path,
-          "FXLINK_AS_LIBRARY": True}
-    exec(compile(source, path, "exec"), ns)
+    ns = ru.load_library(globals(), DYNAMIC_SCRIPT, "FxLink", "FXLINK_AS_LIBRARY", "fxlink_dynamic")
     if "main" not in ns:
-        raise RuntimeError(f"{os.path.basename(path)} is an older version without main() - "
-                           f"run deploy.ps1 so both scripts match.")
+        raise RuntimeError(f"{os.path.basename(ns['__file__'])} is an older version without main() - "
+                           f"redeploy so both scripts match.")
     return ns
 
 
@@ -314,7 +262,7 @@ class FxLinkQueue:
         row.pack(fill="x", pady=(S(2), 0))
         self.inout_label = tk.Label(row, text="", bg=BG, fg=SUB, anchor="w", font=FONT(9))
         self.inout_label.pack(side="left")
-        self.top_btn = tk.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
+        self.top_btn = ru.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
                                  cursor="hand2", padx=S(10), pady=S(5),
                                  highlightthickness=0, command=self.toggle_topmost)
         self.top_btn.pack(side="right")
@@ -336,7 +284,7 @@ class FxLinkQueue:
         scroll.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self.edit_selected())
-        self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        ru.bind_delete(self.tree, lambda e: self.remove_selected())
         self.tree.tag_configure("failed", foreground=BAD)
 
         actions = tk.Frame(self.root, bg=BG)
@@ -512,7 +460,7 @@ class FxLinkQueue:
         fx = self.fx
         exe = fx["find_afterfx"](fx["load_prefs"]())
         if not exe:
-            return "After Effects isn't installed where FxLink looks (C:\\Program Files\\Adobe)."
+            return f"After Effects isn't installed where FxLink looks ({fx.get('AE_WHERE', 'the usual place')})."
         if not fx["afterfx_running"]():
             return "After Effects isn't running. Open your AE project, then Render FxLink."
         answer = fx["run_extendscript"](exe, fx["GET_PROJECT_JSX"], timeout=15)

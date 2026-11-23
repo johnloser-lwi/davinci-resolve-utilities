@@ -1,6 +1,15 @@
-import ctypes
-import json
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "Utility/05_align_clips.py")     # Mac: opens the window in its own Python
+
 import tkinter as tk
 from tkinter import ttk
 
@@ -19,18 +28,7 @@ from tkinter import ttk
 # Read-only on everything except Pan / Tilt. Previous values are printed to the
 # console before each change, because Resolve offers no undo grouping here.
 
-# Tell Windows we handle our own DPI, so the panel isn't tiny on a 4K screen.
-for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
-                        ("shcore", "SetProcessDpiAwareness", 1),
-                        ("user32", "SetProcessDPIAware", None)):
-    try:
-        _f = getattr(getattr(ctypes.windll, _mod), _fn)
-        _f(_arg) if _arg is not None else _f()
-        break
-    except Exception:
-        continue
-
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\align_clips_prefs.json")
+PREFS_FILE = ru.data_path("align_clips_prefs.json")
 
 BG = "#1e1e1e"
 PANEL = "#252525"
@@ -52,27 +50,11 @@ def S(n):
 
 
 def FONT(size, weight=None):
-    pts = max(6, int(round(size * SCALE)))
-    return ("Segoe UI", pts, weight) if weight else ("Segoe UI", pts)
+    return ru.font(size, weight, SCALE)
 
 
 def detect_scale(root):
-    try:
-        dpi = root.winfo_fpixels("1i")
-    except Exception:
-        dpi = 96.0
-    scale = dpi / 96.0
-    if scale < 1.05:
-        # A 4K panel left at 100% Windows scaling still reports 96 DPI
-        try:
-            width = root.winfo_screenwidth()
-        except Exception:
-            width = 1920
-        if width >= 3400:
-            scale = 1.5
-        elif width >= 2800:
-            scale = 1.25
-    return max(1.0, min(scale, 3.0))
+    return ru.detect_scale(root)
 
 
 def resolve_scale(prefs, root):
@@ -88,27 +70,17 @@ def resolve_scale(prefs, root):
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        try:
-            with open(PREFS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    try:
-        with open(PREFS_FILE, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, indent=2)
-    except Exception as e:
-        print(f"Could not save prefs: {e}")
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def make_button(parent, text, command, primary=False, width=None):
     base = ACCENT if primary else BTN
     hover = ACCENT_HOVER if primary else BTN_HOVER
-    btn = tk.Button(parent, text=text, command=command, bg=base,
+    btn = ru.Button(parent, text=text, command=command, bg=base,
                     fg="#ffffff" if primary else FG, relief="flat", bd=0,
                     padx=S(10), pady=S(6), font=FONT(9), cursor="hand2",
                     activebackground=hover, activeforeground=FG,
@@ -515,7 +487,7 @@ class AlignPanel:
         self.canvas.bind("<Configure>", fit_width)
         self.root.bind_all(
             "<MouseWheel>",
-            lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+            lambda e: self.canvas.yview_scroll(ru.wheel_units(e), "units"))
 
         head = tk.Frame(content, bg=BG)
         head.pack(fill="x", padx=S(14), pady=(S(12), S(4)))
@@ -528,7 +500,7 @@ class AlignPanel:
                                   font=FONT(9))
         self.sel_label.pack(side="left")
         make_button(row, "Refresh", self.refresh).pack(side="right")
-        self.top_btn = tk.Button(row, text="On Top", relief="flat", bd=0,
+        self.top_btn = ru.Button(row, text="On Top", relief="flat", bd=0,
                                  font=FONT(9), cursor="hand2", padx=S(10),
                                  pady=S(5), highlightthickness=0,
                                  command=self.toggle_topmost)
@@ -635,7 +607,7 @@ class AlignPanel:
                  anchor="w").pack(side="left", padx=(0, S(6)))
         buttons = {}
         for opt in options:
-            b = tk.Button(row, text=opt, relief="flat", bd=0, font=FONT(9),
+            b = ru.Button(row, text=opt, relief="flat", bd=0, font=FONT(9),
                           cursor="hand2", padx=S(12), pady=S(5),
                           highlightthickness=0,
                           command=lambda o=opt: on_click(o))

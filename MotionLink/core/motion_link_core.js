@@ -1,5 +1,6 @@
 // Motion Link core - shared by the menu scripts, and NOT a menu entry itself:
-// it lives in %APPDATA%\motion_link, outside Cavalry's Scripts folder, so it
+// it lives in the motion_link data folder (see inboxDir), outside Cavalry's
+// Scripts folder, so it
 // never shows up under Window > Scripts.
 //
 // Builds a Composition from a job file written by "Motion Link Export" in
@@ -56,19 +57,24 @@ var CAV = {
 // ====================================================================
 
 var JOB_VERSION = 2;    // 2: "media" (audio or video); version 1 audio jobs still build
-var FALLBACK_INBOX = "C:/Users/john-/AppData/Roaming/motion_link";
+// Matches the Resolve side's data folder:
+//   Mac      ~/Library/Application Support/ResolveUtilities/motion_link
+//   Windows  %APPDATA%\motion_link
+var INBOX_CANDIDATES = ["/Library/Application Support/ResolveUtilities/motion_link",
+                        "/AppData/Roaming/motion_link"];
 
 function log(line) { console.log(line); }
 
 function inboxDir() {
-    // Matches %APPDATA%\motion_link on the Resolve side.
-    try {
-        var home = api.getHomeFolder();
-        if (home) {
-            return String(home).replace(/\\/g, "/") + "/AppData/Roaming/motion_link";
+    var home = "";
+    try { home = String(api.getHomeFolder() || "").replace(/\\/g, "/"); } catch (e) { /* none */ }
+    // Whichever holds this core file is the live one; deploy put it there.
+    for (var i = 0; i < INBOX_CANDIDATES.length; i++) {
+        if (api.filePathExists(home + INBOX_CANDIDATES[i] + "/motion_link_core.js")) {
+            return home + INBOX_CANDIDATES[i];
         }
-    } catch (e) { /* fall through */ }
-    return FALLBACK_INBOX;
+    }
+    return home + INBOX_CANDIDATES[0];
 }
 
 function readJob(explicitPath) {
@@ -470,13 +476,7 @@ function motionLinkBuildBatch() {
 }
 
 function motionLinkInbox() {
-    try {
-        var home = api.getHomeFolder();
-        if (home) {
-            return String(home).replace(/\\/g, "/") + "/AppData/Roaming/motion_link";
-        }
-    } catch (e) { /* fall through */ }
-    return "C:/Users/john-/AppData/Roaming/motion_link";
+    return inboxDir();
 }
 
 function motionLinkNewestFolder() {

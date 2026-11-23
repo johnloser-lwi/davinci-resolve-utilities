@@ -10,7 +10,8 @@
 //      from the Assets window into the Scene window) and select it.
 //   2. Window > Scripts > John > ___Motion Link Probe
 //   3. Read the Console. A copy is written to
-//      <home>/AppData/Roaming/motion_link/probe_dump.json
+//      <home>/Library/Application Support/ResolveUtilities/motion_link/probe_dump.json
+//      (Mac) or <home>/AppData/Roaming/motion_link/probe_dump.json (Windows)
 //
 // IF THE DUMP IS EMPTY: every introspection function name below is a guess, so
 // they may all be wrong. Fall back to reading the IDs straight out of Cavalry's
@@ -176,7 +177,10 @@
     var home = paths.getHomeFolder;
     var dumpPath = null;
     if (home && String(home).charAt(0) !== "<") {
-        dumpPath = String(home).replace(/\\/g, "/") + "/AppData/Roaming/motion_link/probe_dump.json";
+        home = String(home).replace(/\\/g, "/");
+        var macInbox = home + "/Library/Application Support/ResolveUtilities/motion_link";
+        dumpPath = (api.filePathExists(macInbox) ? macInbox : home + "/AppData/Roaming/motion_link")
+                   + "/probe_dump.json";
         try {
             // writeToFile will not create the folder, so this only lands once
             // the Resolve side has run at least one export. Not a problem - the

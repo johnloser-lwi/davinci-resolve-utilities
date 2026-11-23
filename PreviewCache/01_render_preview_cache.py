@@ -1,16 +1,22 @@
-import time
-import json
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "PreviewCache/01_render_preview_cache.py")     # Mac: opens the window in its own Python
+
+import time
 import re
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
 
-if os.name == "nt":
-    PREFS_FILE = os.path.join(os.environ["APPDATA"], "preview_cache_prefs.json")
-else:
-    PREFS_FILE = os.path.join(os.path.expanduser("~"), "Library", "Application Support",
-                              "preview_cache_prefs.json")
+PREFS_FILE = ru.data_path("preview_cache_prefs.json")
 
 SEQUENCE_FORMATS = ("png", "exr", "dpx", "tif", "tiff", "jpg", "jpeg", "bmp")
 RENDER_START_SECONDS = 30     # nothing rendering this long after Start = it never started
@@ -24,15 +30,11 @@ class PreviewCacheError(Exception):
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        with open(PREFS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
-        json.dump(prefs, f, indent=2)
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def ask_preset(preset_names, last_preset=None):
@@ -295,7 +297,7 @@ def main():
     # back to a plain picker if that can't be used.
     default_dir = default_render_dir(project)
     print("Please select the render output folder...")
-    target_dir = fusion.RequestDir(default_dir + os.sep) if default_dir else fusion.RequestDir()
+    target_dir = ru.ask_directory(fusion, default_dir, "Render output folder")
     if not target_dir:
         print("Cancelled: No render path selected.")
         return

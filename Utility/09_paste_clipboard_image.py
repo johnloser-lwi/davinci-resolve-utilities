@@ -1,18 +1,27 @@
-import ctypes
 import os
-import re
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+
 import shutil
 import struct
+import subprocess
+import tempfile
 import time
 import zlib
 from datetime import datetime
-from tkinter import Tk, messagebox
 
 # Paste Clipboard Image - put whatever image is on the clipboard onto the
 # timeline at the playhead.
 #
 # Right-click an image on a website > Copy Image, then run this. The image is
-# saved to <project media location>\..\Images - the Images folder the project
+# saved to <project media location>/../Images - the Images folder the project
 # template keeps beside the media folder, which other tools use too - imported
 # into an
 # "Images" bin, and dropped at the playhead on the first free track ABOVE
@@ -23,10 +32,12 @@ from tkinter import Tk, messagebox
 # a paste.
 #
 # WHAT IT CAN READ, best first:
-#   1. A copied FILE (Ctrl+C on an image in Explorer)  - the original, untouched
+#   1. A copied FILE (Ctrl+C in Explorer / Cmd+C in Finder) - the original, untouched
 #   2. PNG data   - what browsers put on the clipboard; lossless, keeps alpha
 #   3. A bitmap   - screenshots and older apps; converted to PNG here, with no
 #                   extra libraries, so it works inside Resolve's Python
+#                   (Windows: a DIB, converted by hand. Mac: TIFF, converted by
+#                   macOS's own sips)
 #
 # Copying an image's ADDRESS (a URL as text) is not supported - that would mean
 # downloading from the internet on your behalf. Use Copy Image instead.
@@ -43,15 +54,12 @@ class PasteError(Exception):
 
 
 def fail(message):
-    print(f"Paste Clipboard Image: {message}")
-    try:
-        root = Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        messagebox.showwarning("Paste Clipboard Image", message, parent=root)
-        root.destroy()
-    except Exception:
-        pass
+    ru.message("Paste Clipboard Image", message, "warning")
+
+
+NO_IMAGE = ("There's no image on the clipboard.\n\n"
+            "In your browser, right-click the image and choose "
+            "'Copy Image' (not 'Copy Image Address').")
 
 
 # --------------------------------------------------------------------------
@@ -62,24 +70,26 @@ CF_DIB = 8
 CF_HDROP = 15
 CF_DIBV5 = 17
 
-_user32 = ctypes.windll.user32
-_kernel32 = ctypes.windll.kernel32
-_shell32 = ctypes.windll.shell32
+if ru.IS_WIN:
+    import ctypes
+    _user32 = ctypes.windll.user32
+    _kernel32 = ctypes.windll.kernel32
+    _shell32 = ctypes.windll.shell32
 
-# Handles and pointers are 64-bit. Without explicit types ctypes truncates them
-# to 32 bits, and the failure looks like "the clipboard is empty".
-_user32.GetClipboardData.restype = ctypes.c_void_p
-_user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
-_user32.RegisterClipboardFormatW.restype = ctypes.c_uint
-_user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
-_kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalLock.restype = ctypes.c_void_p
-_kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
-_kernel32.GlobalSize.restype = ctypes.c_size_t
-_shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                    ctypes.c_wchar_p, ctypes.c_uint]
-_shell32.DragQueryFileW.restype = ctypes.c_uint
+    # Handles and pointers are 64-bit. Without explicit types ctypes truncates them
+    # to 32 bits, and the failure looks like "the clipboard is empty".
+    _user32.GetClipboardData.restype = ctypes.c_void_p
+    _user32.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+    _user32.RegisterClipboardFormatW.restype = ctypes.c_uint
+    _user32.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+    _kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalLock.restype = ctypes.c_void_p
+    _kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalSize.argtypes = [ctypes.c_void_p]
+    _kernel32.GlobalSize.restype = ctypes.c_size_t
+    _shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                        ctypes.c_wchar_p, ctypes.c_uint]
+    _shell32.DragQueryFileW.restype = ctypes.c_uint
 
 
 def _open_clipboard(attempts=20):
@@ -117,7 +127,7 @@ def _read_files():
     return paths
 
 
-def clipboard_image():
+def clipboard_image_windows():
     """What image the clipboard holds, as (kind, payload).
 
     kind is "file" (a path), "png" (PNG bytes) or "dib" (bitmap bytes).
@@ -150,9 +160,63 @@ def clipboard_image():
     finally:
         _user32.CloseClipboard()
 
-    raise PasteError("There's no image on the clipboard.\n\n"
-                     "In your browser, right-click the image and choose "
-                     "'Copy Image' (not 'Copy Image Address').")
+    raise PasteError(NO_IMAGE)
+
+
+# --------------------------------------------------------------------------
+# Mac clipboard - via AppleScript, which needs no permissions and no libraries
+# --------------------------------------------------------------------------
+
+def _clipboard_to_file(apple_class, path):
+    """Write the clipboard's data of one type (e.g. «class PNGf») to path."""
+    target = path.replace("\\", "\\\\").replace('"', '\\"')
+    code, _ = ru.osascript([
+        f"set d to (the clipboard as {apple_class})",
+        f'set f to open for access (POSIX file "{target}") with write permission',
+        "try",
+        "set eof f to 0",
+        "write d to f",
+        "end try",
+        "close access f"], timeout=30)
+    return code == 0 and os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def clipboard_image_mac():
+    """Same answer as the Windows version: ("file", path) or ("png", bytes)."""
+    _, info = ru.osascript(["clipboard info"], timeout=10)
+
+    # A file copied in Finder. Finder also puts the file's ICON on the
+    # clipboard as a picture, so a non-image file must not fall through to it.
+    if "furl" in info:
+        code, path = ru.osascript(["POSIX path of (the clipboard as «class furl»)"], timeout=10)
+        if code == 0 and path:
+            if os.path.splitext(path)[1].lower() in IMPORTABLE and os.path.isfile(path):
+                return "file", path
+            raise PasteError(f"The copied file isn't an image Resolve can import:\n\n{path}")
+
+    work = tempfile.mkdtemp(prefix="paste_clipboard_")
+    try:
+        png = os.path.join(work, "clip.png")
+        if "PNGf" in info and _clipboard_to_file("«class PNGf»", png):
+            with open(png, "rb") as f:
+                return "png", f.read()
+        if "TIFF" in info:
+            tiff = os.path.join(work, "clip.tiff")
+            if _clipboard_to_file("«class TIFF»", tiff):
+                done = subprocess.run(["sips", "-s", "format", "png", tiff, "--out", png],
+                                      capture_output=True)
+                if done.returncode == 0 and os.path.isfile(png):
+                    with open(png, "rb") as f:
+                        return "png", f.read()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    raise PasteError(NO_IMAGE)
+
+
+def clipboard_image():
+    if ru.IS_MAC:
+        return clipboard_image_mac()
+    return clipboard_image_windows()
 
 
 # --------------------------------------------------------------------------
@@ -317,7 +381,7 @@ def save_image(kind, payload, folder):
 
     if kind == "file":
         source = os.path.abspath(payload)
-        if os.path.normcase(os.path.dirname(source)) == os.path.normcase(folder):
+        if os.path.normcase(os.path.dirname(source)) == os.path.normcase(os.path.abspath(folder)):
             return source                       # already where it belongs
         target = unique_path(folder, os.path.basename(source))
         shutil.copy2(source, target)

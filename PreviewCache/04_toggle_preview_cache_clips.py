@@ -1,21 +1,26 @@
-import json
 import os
+import sys
 
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\preview_cache_prefs.json")
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+
+
+PREFS_FILE = ru.data_path("preview_cache_prefs.json")
 COLOR_VISIBLE = "Green"
 COLOR_HIDDEN = "Chocolate"
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        with open(PREFS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
-        json.dump(prefs, f, indent=2)
+    ru.write_json(PREFS_FILE, prefs)
 
 
 resolve = bmd.scriptapp("Resolve")

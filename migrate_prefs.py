@@ -29,9 +29,8 @@ WHAT CHANGES ON THE WAY IN
 
 WHERE THINGS GO
   Windows: %APPDATA%, where the tools keep them today.
-  Mac:     ~/Library/Application Support/ResolveUtilities - the folder the Mac
-           versions of the tools will read. (They still need porting to it; see
-           the migration report.)
+  Mac:     ~/Library/Application Support/ResolveUtilities - where the tools keep
+           them on a Mac (resolve_utils.DATA_DIR).
 """
 import argparse
 import datetime
@@ -64,6 +63,7 @@ PREFS_FILES = [
     "multicam_color_prefs.json",
     "nest_clips_prefs.json",
     "preview_cache_prefs.json",
+    "preview_cache_queue_prefs.json",
     "spline_keyframe_sync_prefs.json",
     "timeline_hierarchy_prefs.json",
 ]
@@ -71,6 +71,7 @@ FOLDERS = ["FusionClipboard"]
 NOT_MOVED = {
     "fxlink_queue.json": "queue - temporary",
     "motion_link_queue.json": "queue - temporary",
+    "preview_cache_queue.json": "queue - temporary",
     "motion_link": "Motion Link job files - temporary",
     "spline_keyframe_sync_baselines.json": "tied to comps on this machine",
     "spline_keyframe_sync_backups": "tied to comps on this machine",

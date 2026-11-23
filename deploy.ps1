@@ -33,9 +33,13 @@ if (-not (Test-Path $dest)) {
 }
 
 # Only scripts inside a tool folder are Resolve menu entries; .py files at the
-# repo root (migrate_prefs.py) are command-line tools run with plain Python.
+# repo root (migrate_prefs.py) are command-line tools run with plain Python, and
+# _shared holds the library every tool imports (deployed below, not as a menu entry).
+$sharedDir = Join-Path $source "_shared"
 $scripts = Get-ChildItem -Path $source -Recurse -Filter "*.py" |
-    Where-Object { $_.DirectoryName -ne $source }
+    Where-Object { $_.DirectoryName -ne $source -and
+                   -not $_.FullName.StartsWith($sharedDir + "\") -and
+                   $_.FullName -notmatch '\\(\.[^\\]+|build|dist|__pycache__)\\' }
 
 if ($scripts.Count -eq 0) {
     Write-Host "No .py scripts found in $source"
@@ -57,6 +61,16 @@ foreach ($file in $scripts) {
 
 Write-Host "`nDone. $copied script(s) deployed to:"
 Write-Host "  $dest"
+
+# --- Shared library (resolve_utils.py) ---
+# Every tool imports it from here; it can't sit in the Scripts folder, where it
+# would show up as a menu entry of its own.
+$libDir = Join-Path $env:APPDATA "ResolveUtilities\lib"
+if (-not (Test-Path $libDir)) { New-Item -ItemType Directory -Path $libDir -Force | Out-Null }
+foreach ($file in (Get-ChildItem -Path $sharedDir -Filter "*.py" -ErrorAction SilentlyContinue)) {
+    Copy-Item -Path $file.FullName -Destination (Join-Path $libDir $file.Name) -Force
+    Write-Host "Deployed shared library: $($file.Name) -> $libDir"
+}
 
 # --- Data files that sit beside a script ---
 # The Fusion Clipboard's Studio-safe conversion rules are data, not code, so

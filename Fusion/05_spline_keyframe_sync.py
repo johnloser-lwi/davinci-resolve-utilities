@@ -1,7 +1,17 @@
-import ctypes
+import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "Fusion/05_spline_keyframe_sync.py")     # Mac: opens the window in its own Python
+
 import json
 import math
-import os
 import tkinter as tk
 import traceback
 from tkinter import ttk
@@ -34,17 +44,7 @@ from tkinter import ttk
 #
 # Run this from the Fusion page with a comp open.
 
-for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
-                        ("shcore", "SetProcessDpiAwareness", 1),
-                        ("user32", "SetProcessDPIAware", None)):
-    try:
-        _f = getattr(getattr(ctypes.windll, _mod), _fn)
-        _f(_arg) if _arg is not None else _f()
-        break
-    except Exception:
-        continue
-
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\spline_keyframe_sync_prefs.json")
+PREFS_FILE = ru.data_path("spline_keyframe_sync_prefs.json")
 
 BG = "#1e1e1e"
 PANEL = "#252525"
@@ -73,26 +73,11 @@ def S(n):
 
 
 def FONT(size, weight=None):
-    pts = max(6, int(round(size * SCALE)))
-    return ("Segoe UI", pts, weight) if weight else ("Segoe UI", pts)
+    return ru.font(size, weight, SCALE)
 
 
 def detect_scale(root):
-    try:
-        dpi = root.winfo_fpixels("1i")
-    except Exception:
-        dpi = 96.0
-    scale = dpi / 96.0
-    if scale < 1.05:
-        try:
-            width = root.winfo_screenwidth()
-        except Exception:
-            width = 1920
-        if width >= 3400:
-            scale = 1.5
-        elif width >= 2800:
-            scale = 1.25
-    return max(1.0, min(scale, 3.0))
+    return ru.detect_scale(root)
 
 
 def resolve_scale(prefs, root):
@@ -108,27 +93,17 @@ def resolve_scale(prefs, root):
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        try:
-            with open(PREFS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    try:
-        with open(PREFS_FILE, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, indent=2)
-    except Exception as e:
-        print(f"Could not save prefs: {e}")
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def make_button(parent, text, command, primary=False, width=None):
     base = ACCENT if primary else BTN
     hover = ACCENT_HOVER if primary else BTN_HOVER
-    btn = tk.Button(parent, text=text, command=command, bg=base,
+    btn = ru.Button(parent, text=text, command=command, bg=base,
                     fg="#ffffff" if primary else FG, relief="flat", bd=0,
                     padx=S(10), pady=S(6), font=FONT(9), cursor="hand2",
                     activebackground=hover, activeforeground=FG,
@@ -290,7 +265,7 @@ def bezier_slope(p0, p1, p2, p3, u):
 # shape is recorded the first time a segment is seen and reused from then on.
 # --------------------------------------------------------------------------
 
-BASELINE_FILE = os.path.expandvars(r"%APPDATA%\spline_keyframe_sync_baselines.json")
+BASELINE_FILE = ru.data_path("spline_keyframe_sync_baselines.json")
 
 
 def load_baselines():
@@ -576,7 +551,7 @@ def apply_split(spline, seg, split):
 # there is no other way back from a bad write.
 # --------------------------------------------------------------------------
 
-BACKUP_DIR = os.path.expandvars(r"%APPDATA%\spline_keyframe_sync_backups")
+BACKUP_DIR = ru.data_path("spline_keyframe_sync_backups")
 BACKUP_KEEP = 30
 
 
@@ -791,7 +766,7 @@ class SplineSync:
         self.info = tk.Label(row, text="", bg=BG, fg=SUB, anchor="w", font=FONT(9))
         self.info.pack(side="left")
         make_button(row, "Rescan", self.rescan).pack(side="right")
-        self.top_btn = tk.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
+        self.top_btn = ru.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
                                  cursor="hand2", padx=S(10), pady=S(5),
                                  highlightthickness=0, command=self.toggle_topmost)
         self.top_btn.pack(side="right", padx=(0, S(6)))

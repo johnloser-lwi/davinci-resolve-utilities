@@ -1,6 +1,17 @@
+import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "FxLink/02_fx_link_dynamic.py")     # Mac: opens the window in its own Python
+
 import glob
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -10,7 +21,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\fxlink_prefs.json")
+PREFS_FILE = ru.data_path("fxlink_prefs.json")
 CLIP_COLOR = "Pink"
 STAGING_DIR = os.path.join(tempfile.gettempdir(), "fxlink_staging")
 
@@ -29,15 +40,11 @@ SEQUENCE_PAD = 5
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        with open(PREFS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
-        json.dump(prefs, f, indent=2)
+    ru.write_json(PREFS_FILE, prefs)
 
 
 PROBLEMS = []
@@ -449,11 +456,21 @@ def render_placeholder(project, timeline, settings):
                   + ". Re-enable them by hand.")
 
 
+if ru.IS_MAC:
+    AE_GLOB = "/Applications/Adobe After Effects */Adobe After Effects *.app"
+    AE_WHERE = "/Applications"
+else:
+    AE_GLOB = r"C:\Program Files\Adobe\Adobe After Effects *\Support Files\AfterFX.exe"
+    AE_WHERE = r"C:\Program Files\Adobe"
+
+
 def find_afterfx(prefs):
+    """The After Effects to drive: AfterFX.exe on Windows, the .app on a Mac."""
     cached = prefs.get("afterfx_path")
     if cached and os.path.exists(cached):
         return cached
-    candidates = glob.glob(r"C:\Program Files\Adobe\Adobe After Effects *\Support Files\AfterFX.exe")
+    # The Mac folder also holds "Adobe After Effects Render Engine 20xx.app".
+    candidates = [p for p in glob.glob(AE_GLOB) if "Render Engine" not in p]
     if not candidates:
         return None
     # Newest version sorts last (e.g. "... 2024" < "... 2025")
@@ -463,6 +480,9 @@ def find_afterfx(prefs):
 
 
 def afterfx_running():
+    if ru.IS_MAC:
+        return subprocess.run(["pgrep", "-x", "After Effects"],
+                              capture_output=True).returncode == 0
     out = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq AfterFX.exe", "/NH"],
         capture_output=True, text=True,
@@ -470,14 +490,48 @@ def afterfx_running():
     return "AfterFX.exe" in out
 
 
+def launch_afterfx(afterfx_exe, aep_path=None):
+    """Start After Effects, optionally with a project."""
+    extra = [aep_path] if aep_path else []
+    if ru.IS_MAC:
+        subprocess.Popen(["open", "-a", afterfx_exe] + extra)
+    else:
+        subprocess.Popen([afterfx_exe] + extra)
+
+
+def _applescript_text(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _send_to_afterfx(afterfx_exe, jsx_path, timeout):
+    """Hand a .jsx to the RUNNING After Effects; returns the launcher process.
+
+    Windows: AfterFX.exe -r forwards it. Mac: AppleScript's DoScript, which
+    After Effects has always supported. The first time, macOS asks whether
+    Resolve may control After Effects - that has to be allowed.
+    """
+    if not ru.IS_MAC:
+        return subprocess.Popen([afterfx_exe, "-r", jsx_path])
+    if not afterfx_running():
+        return None                     # still launching: an Apple event would just queue up
+    app_name = os.path.splitext(os.path.basename(afterfx_exe.rstrip("/")))[0]
+    js = "$.evalFile(new File(" + json.dumps(jsx_path) + "));"
+    return subprocess.Popen(
+        ["osascript",
+         "-e", f"with timeout of {int(timeout) + 10} seconds",
+         "-e", f"tell application {_applescript_text(app_name)} to DoScript {_applescript_text(js)}",
+         "-e", "end timeout"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+
+
 def run_extendscript(afterfx_exe, jsx_code, timeout=20):
     """Run ExtendScript in the running AE instance; returns contents of the
     result file the script writes, or None on timeout.
 
     The JSX writes to a .part file and renames it when done, so the result
-    file only ever appears complete. We also wait for the AfterFX launcher
-    process to exit before returning, so back-to-back calls can't collide
-    and trigger AE's "only one script can be run at a time" warning."""
+    file only ever appears complete. We also wait for the launcher process to
+    exit before returning, so back-to-back calls can't collide and trigger
+    AE's "only one script can be run at a time" warning."""
     result_path = os.path.join(tempfile.gettempdir(), f"fxlink_ae_result_{os.getpid()}.txt")
     for stale in (result_path, result_path + ".part"):
         if os.path.exists(stale):
@@ -490,8 +544,10 @@ def run_extendscript(afterfx_exe, jsx_code, timeout=20):
     with open(jsx_path, "w", encoding="utf-8") as f:
         f.write(jsx)
 
-    # -r forwards the script to the already-running AE instance
-    launcher = subprocess.Popen([afterfx_exe, "-r", jsx_path])
+    launcher = _send_to_afterfx(afterfx_exe, jsx_path, timeout)
+    if launcher is None:
+        time.sleep(1)
+        return None
 
     result = None
     deadline = time.time() + timeout
@@ -502,15 +558,24 @@ def run_extendscript(afterfx_exe, jsx_code, timeout=20):
             os.remove(result_path)
             os.remove(jsx_path)
             break
+        if launcher.poll() not in (None, 0):
+            break                               # the launcher itself failed
         time.sleep(0.25)
 
     # Don't return until the launcher process is gone, otherwise the next
-    # AfterFX.exe -r call can race against this one inside AE.
+    # call can race against this one inside AE.
     try:
         launcher.wait(timeout=15)
     except subprocess.TimeoutExpired:
         pass
 
+    if ru.IS_MAC and result is None and launcher.returncode not in (None, 0):
+        err = (launcher.stderr.read() if launcher.stderr else "") or ""
+        if "-1743" in err or "Not authorized" in err:
+            problem("Error: macOS isn't letting Resolve control After Effects. Allow it in "
+                    "System Settings > Privacy & Security > Automation, then run FxLink again.")
+        elif err.strip() and "-1712" not in err:          # -1712: AE still busy starting up
+            print(f"After Effects didn't take the script: {err.strip()}")
     return result
 
 
@@ -644,11 +709,12 @@ def ensure_ae_project(afterfx_exe, aep_path, timeout=90):
     """Make sure AE is running with aep_path open — launching AE or switching
     projects as needed. Returns True once AE reports the expected project."""
     def norm(p):
-        return os.path.normcase(os.path.normpath(p))
+        p = os.path.normcase(os.path.normpath(p))
+        return p.casefold() if ru.IS_MAC else p      # Mac disks ignore case too
 
     if not afterfx_running():
         print(f"Launching After Effects with {os.path.basename(aep_path)} ...")
-        subprocess.Popen([afterfx_exe, aep_path])
+        launch_afterfx(afterfx_exe, aep_path)
     else:
         current = run_extendscript(afterfx_exe, GET_PROJECT_JSX)
         if current and current != "__UNSAVED__" and norm(current) == norm(aep_path):
@@ -704,7 +770,7 @@ def main(job=None):
                 aep_hint = find_aep_for_output(pink_path)
 
         if not afterfx_exe:
-            problem("Error: Could not find AfterFX.exe under C:\\Program Files\\Adobe.")
+            problem(f"Error: Could not find After Effects under {AE_WHERE}.")
         elif linked_path:
             # Connect flow: the Pink clip's path maps to the AE project — launch
             # AE with it or switch the running AE to it as needed.
@@ -733,7 +799,7 @@ def main(job=None):
                 # Launch AE with the mapped project now so it boots while Resolve
                 # renders; the post-render project query retries until it's up.
                 print(f"Launching After Effects with {os.path.basename(aep_hint)} — it will load during the render...")
-                subprocess.Popen([afterfx_exe, aep_hint])
+                launch_afterfx(afterfx_exe, aep_hint)
 
             presets_dict = project.GetRenderPresets()
             preset_names = [presets_dict[k] for k in sorted(presets_dict.keys())]

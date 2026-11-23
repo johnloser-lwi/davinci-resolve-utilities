@@ -1,5 +1,15 @@
-import json
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "Utility/04_marker_progress.py")     # Mac: opens the window in its own Python
+
 import tkinter as tk
 from tkinter import messagebox
 
@@ -18,7 +28,7 @@ from tkinter import messagebox
 #
 # Strictly read-only — nothing on the timeline is added, changed, or deleted.
 
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\marker_progress_prefs.json")
+PREFS_FILE = ru.data_path("marker_progress_prefs.json")
 
 # Dark palette so the report doesn't glare next to Resolve's UI
 BG = "#1e1e1e"
@@ -38,15 +48,11 @@ MARKER_COLORS = {
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        with open(PREFS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    with open(PREFS_FILE, "w") as f:
-        json.dump(prefs, f, indent=2)
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def frame_to_tc(frame, fps, drop_frame):
@@ -89,9 +95,9 @@ def ask_options(track_labels, color_counts, default_ignored, default_excluded,
     left = tk.Frame(cols, bg=BG)
     left.grid(row=0, column=0, sticky="nw", padx=(0, 24))
     tk.Label(left, text="Ignore these tracks", bg=BG, fg=FG,
-             font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+             font=ru.font(9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
     tk.Label(left, text="(your base / raw-footage track)", bg=BG, fg=SUB,
-             font=("Segoe UI", 8), anchor="w").pack(fill="x", pady=(0, 6))
+             font=ru.font(8), anchor="w").pack(fill="x", pady=(0, 6))
 
     track_vars = {}
     for idx, label in track_labels:
@@ -105,9 +111,9 @@ def ask_options(track_labels, color_counts, default_ignored, default_excluded,
     right = tk.Frame(cols, bg=BG)
     right.grid(row=0, column=1, sticky="nw")
     tk.Label(right, text="Include these markers", bg=BG, fg=FG,
-             font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+             font=ru.font(9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
     tk.Label(right, text=f"({len(color_counts)} color(s) on this timeline)", bg=BG, fg=SUB,
-             font=("Segoe UI", 8), anchor="w").pack(fill="x", pady=(0, 6))
+             font=ru.font(8), anchor="w").pack(fill="x", pady=(0, 6))
 
     color_vars = {}
     for color, count in color_counts:
@@ -135,17 +141,17 @@ def ask_options(track_labels, color_counts, default_ignored, default_excluded,
     thresh_row = tk.Frame(root, bg=BG)
     thresh_row.pack(fill="x", padx=14, pady=(10, 0))
     tk.Label(thresh_row, text="Done when clips cover at least", bg=BG, fg=FG,
-             font=("Segoe UI", 9)).pack(side="left")
+             font=ru.font(9)).pack(side="left")
     thresh_var = tk.StringVar(value=str(default_threshold))
     tk.Spinbox(thresh_row, from_=1, to=100, increment=5, width=4,
                textvariable=thresh_var, justify="center", bg=PANEL, fg=FG,
                buttonbackground=PANEL, relief="flat", insertbackground=FG,
-               font=("Segoe UI", 9)).pack(side="left", padx=6)
+               font=ru.font(9)).pack(side="left", padx=6)
     tk.Label(thresh_row, text="% of the marker", bg=BG, fg=FG,
-             font=("Segoe UI", 9)).pack(side="left")
+             font=ru.font(9)).pack(side="left")
     tk.Label(root, text="Stops a clip that clips the edge of a marker by a frame "
                         "or two from counting as work.",
-             bg=BG, fg=SUB, font=("Segoe UI", 8), anchor="w",
+             bg=BG, fg=SUB, font=ru.font(8), anchor="w",
              justify="left").pack(fill="x", padx=14, pady=(2, 0))
 
     def on_ok():
@@ -183,16 +189,16 @@ def show_report(timeline_name, subtitle, total, completed, lines):
     head = tk.Frame(root, bg=BG)
     head.pack(fill="x", padx=16, pady=(14, 0))
     tk.Label(head, text=timeline_name, bg=BG, fg=FG,
-             font=("Segoe UI", 12, "bold"), anchor="w").pack(fill="x")
+             font=ru.font(12, "bold"), anchor="w").pack(fill="x")
     tk.Label(head, text=subtitle, bg=BG, fg=SUB,
-             font=("Segoe UI", 9), anchor="w", justify="left").pack(fill="x")
+             font=ru.font(9), anchor="w", justify="left").pack(fill="x")
 
     stats = tk.Frame(root, bg=BG)
     stats.pack(fill="x", padx=16, pady=(12, 4))
     tk.Label(stats, text=f"{pct:.1f}%", bg=BG, fg=bar_color,
-             font=("Segoe UI", 22, "bold")).pack(side="left")
+             font=ru.font(22, "bold")).pack(side="left")
     tk.Label(stats, text=f"  {completed} of {total} done   ·   {remaining} remaining",
-             bg=BG, fg=FG, font=("Segoe UI", 10)).pack(side="left", anchor="s", pady=(0, 6))
+             bg=BG, fg=FG, font=ru.font(10)).pack(side="left", anchor="s", pady=(0, 6))
 
     canvas = tk.Canvas(root, height=BAR_H, bg=TRACK_BG, highlightthickness=0)
     canvas.pack(fill="x", padx=16, pady=(0, 14))
@@ -208,10 +214,10 @@ def show_report(timeline_name, subtitle, total, completed, lines):
 
     if lines:
         tk.Label(root, text=f"Untouched markers ({len(lines)})", bg=BG, fg=FG,
-                 font=("Segoe UI", 10, "bold"), anchor="w").pack(fill="x", padx=16)
+                 font=ru.font(10, "bold"), anchor="w").pack(fill="x", padx=16)
     else:
         tk.Label(root, text="Everything is covered — nothing left to build.",
-                 bg=BG, fg="#4caf72", font=("Segoe UI", 10, "bold"),
+                 bg=BG, fg="#4caf72", font=ru.font(10, "bold"),
                  anchor="w").pack(fill="x", padx=16)
 
     body = "\n".join(lines) if lines else ""
@@ -221,7 +227,7 @@ def show_report(timeline_name, subtitle, total, completed, lines):
     scroll = tk.Scrollbar(text_frame)
     scroll.pack(side="right", fill="y")
     text = tk.Text(text_frame, wrap="word", bg=PANEL, fg=FG, relief="flat",
-                   font=("Consolas", 9), yscrollcommand=scroll.set,
+                   font=ru.font(9, mono=True), yscrollcommand=scroll.set,
                    padx=8, pady=8, height=12)
     text.pack(side="left", fill="both", expand=True)
     scroll.config(command=text.yview)

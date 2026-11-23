@@ -1,7 +1,16 @@
-import ctypes
-import json
 import os
-import glob
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+ru.bootstrap(globals(), "MotionLink/01_motion_link_export.py")     # Mac: opens the window in its own Python
+
+import json
 import re
 import tkinter as tk
 import traceback
@@ -34,18 +43,8 @@ from tkinter import filedialog, ttk
 #   Cavalry frame 0 is the start of the exported range, not the start of the
 #   timeline:  resolve_frame = mark_in + cavalry_frame
 
-for _mod, _fn, _arg in (("shcore", "SetProcessDpiAwareness", 2),
-                        ("shcore", "SetProcessDpiAwareness", 1),
-                        ("user32", "SetProcessDPIAware", None)):
-    try:
-        _f = getattr(getattr(ctypes.windll, _mod), _fn)
-        _f(_arg) if _arg is not None else _f()
-        break
-    except Exception:
-        continue
-
-PREFS_FILE = os.path.expandvars(r"%APPDATA%\motion_link_prefs.json")
-INBOX_DIR = os.path.expandvars(r"%APPDATA%\motion_link")
+PREFS_FILE = ru.data_path("motion_link_prefs.json")
+INBOX_DIR = ru.data_path("motion_link")
 JOB_VERSION = 2     # 2: "media" (audio or video) replaces "audio"
 
 BG = "#1e1e1e"
@@ -70,26 +69,11 @@ def S(n):
 
 
 def FONT(size, weight=None):
-    pts = max(6, int(round(size * SCALE)))
-    return ("Segoe UI", pts, weight) if weight else ("Segoe UI", pts)
+    return ru.font(size, weight, SCALE)
 
 
 def detect_scale(root):
-    try:
-        dpi = root.winfo_fpixels("1i")
-    except Exception:
-        dpi = 96.0
-    scale = dpi / 96.0
-    if scale < 1.05:
-        try:
-            width = root.winfo_screenwidth()
-        except Exception:
-            width = 1920
-        if width >= 3400:
-            scale = 1.5
-        elif width >= 2800:
-            scale = 1.25
-    return max(1.0, min(scale, 3.0))
+    return ru.detect_scale(root)
 
 
 def resolve_scale(prefs, root):
@@ -105,27 +89,17 @@ def resolve_scale(prefs, root):
 
 
 def load_prefs():
-    if os.path.exists(PREFS_FILE):
-        try:
-            with open(PREFS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return ru.read_json(PREFS_FILE, {})
 
 
 def save_prefs(prefs):
-    try:
-        with open(PREFS_FILE, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, indent=2)
-    except Exception as e:
-        print(f"Could not save prefs: {e}")
+    ru.write_json(PREFS_FILE, prefs)
 
 
 def make_button(parent, text, command, primary=False):
     base = ACCENT if primary else BTN
     hover = ACCENT_HOVER if primary else BTN_HOVER
-    btn = tk.Button(parent, text=text, command=command, bg=base,
+    btn = ru.Button(parent, text=text, command=command, bg=base,
                     fg="#ffffff" if primary else FG, relief="flat", bd=0,
                     padx=S(12), pady=S(6), font=FONT(9), cursor="hand2",
                     activebackground=hover, activeforeground=FG,
@@ -256,8 +230,6 @@ def find_output(folder, stem):
 MODE_VIDEO = "footage"      # FxLink's mode names, so its settings window is shared
 MODE_AUDIO = "audio"
 FXLINK_SCRIPT = "02_fx_link_dynamic.py"
-RESOLVE_SCRIPTS = os.path.expandvars(
-    r"%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility")
 _FX = None
 
 
@@ -265,37 +237,18 @@ class ExportError(Exception):
     """A problem worded for the user."""
 
 
-def find_fxlink_script():
-    candidates = []
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(os.path.dirname(here), "FxLink", FXLINK_SCRIPT))
-    except NameError:
-        pass                                    # some embedded runners have no __file__
-    candidates.append(os.path.join(RESOLVE_SCRIPTS, "John", "FxLink", FXLINK_SCRIPT))
-    candidates += glob.glob(os.path.join(RESOLVE_SCRIPTS, "**", "*fx_link_dynamic.py"),
-                            recursive=True)
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
 def fxlink():
     """FxLink's functions, loaded once, without running FxLink."""
     global _FX
     if _FX is None:
-        path = find_fxlink_script()
-        if not path:
+        try:
+            ns = ru.load_library(globals(), FXLINK_SCRIPT, "FxLink", "FXLINK_AS_LIBRARY",
+                                 "fxlink_dynamic")
+        except RuntimeError:
             raise ExportError(f"Motion Link renders with FxLink's code and couldn't find "
-                              f"{FXLINK_SCRIPT}. Run deploy.ps1.")
-        with open(path, "r", encoding="utf-8") as f:
-            source = f.read()
-        ns = {"bmd": bmd, "__name__": "fxlink_dynamic", "__file__": path,
-              "FXLINK_AS_LIBRARY": True}
-        exec(compile(source, path, "exec"), ns)
+                              f"{FXLINK_SCRIPT}. Redeploy the scripts.")
         if "run_render" not in ns or "target" not in ns["ask_options"].__code__.co_varnames:
-            raise ExportError(f"{os.path.basename(path)} is an older version - run deploy.ps1 "
+            raise ExportError(f"{os.path.basename(ns['__file__'])} is an older version - redeploy "
                               f"so FxLink and Motion Link match.")
         _FX = ns
     return _FX
@@ -453,7 +406,7 @@ def export_range(project, timeline, dest, settings, whole, comp_name=None):
 
 
 def write_batch(project_name, sidecars):
-    """%APPDATA%\\motion_link\\latest_batch.json - what "Build Batch" reads."""
+    """<data folder>/motion_link/latest_batch.json - what "Build Batch" reads."""
     path = os.path.join(INBOX_DIR, "latest_batch.json")
     os.makedirs(INBOX_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -532,7 +485,7 @@ class MotionLink:
         self.info = tk.Label(row, text="", bg=BG, fg=SUB, anchor="w", font=FONT(9))
         self.info.pack(side="left")
         make_button(row, "Refresh", self.refresh).pack(side="right")
-        self.top_btn = tk.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
+        self.top_btn = ru.Button(row, text="On Top", relief="flat", bd=0, font=FONT(9),
                                  cursor="hand2", padx=S(10), pady=S(5),
                                  highlightthickness=0, command=self.toggle_topmost)
         self.top_btn.pack(side="right", padx=(0, S(6)))

@@ -1,6 +1,15 @@
 import os
+import sys
+
+# Shared helpers (resolve_utils.py) live outside Resolve's Scripts menu - deploy puts them there.
+_LIB = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~/Library/Application Support"),
+                    "ResolveUtilities", "lib")
+if _LIB not in sys.path:
+    sys.path.insert(0, _LIB)
+sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded between runs
+import resolve_utils as ru
+
 import re
-from tkinter import Tk, messagebox
 
 # Clears the preview cache across the WHOLE project, not just the open
 # timeline.
@@ -66,12 +75,7 @@ def item_key(mpi):
 
 
 def confirm(message):
-    root = Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    answer = messagebox.askyesno("Clear Preview Cache", message, parent=root)
-    root.destroy()
-    return answer
+    return ru.ask_yes_no("Clear Preview Cache", message)
 
 
 resolve = bmd.scriptapp("Resolve")
