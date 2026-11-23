@@ -181,9 +181,13 @@ def osascript(lines, timeout=None):
     for line in lines:
         args += ["-e", line]
     try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return out.returncode, out.stdout.strip()
-    except Exception:
+        # Bytes, decoded here as UTF-8: inside Resolve, text=True decodes as
+        # ASCII, and AppleScript output is full of « » - that failure used to
+        # look exactly like "no image on the clipboard".
+        out = subprocess.run(args, capture_output=True, timeout=timeout)
+        return out.returncode, out.stdout.decode("utf-8", "replace").strip()
+    except Exception as e:
+        print(f"osascript failed: {e}")
         return 1, ""
 
 
@@ -493,7 +497,7 @@ def find_tk_python():
     probe = "import sys, tkinter; sys.stdout.write(str(tkinter.TkVersion))"
     for candidate in _python_candidates():
         try:
-            out = subprocess.run([candidate, "-c", probe], capture_output=True, text=True,
+            out = subprocess.run([candidate, "-c", probe], capture_output=True, encoding="utf-8", errors="replace",
                                  timeout=15, env=_clean_env())
             version = float(out.stdout.strip()) if out.returncode == 0 else 0.0
         except Exception:

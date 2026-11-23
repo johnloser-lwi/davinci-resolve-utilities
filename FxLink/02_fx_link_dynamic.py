@@ -521,7 +521,7 @@ def _send_to_afterfx(afterfx_exe, jsx_path, timeout):
          "-e", f"with timeout of {int(timeout) + 10} seconds",
          "-e", f"tell application {_applescript_text(app_name)} to DoScript {_applescript_text(js)}",
          "-e", "end timeout"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, encoding="utf-8", errors="replace")
 
 
 def run_extendscript(afterfx_exe, jsx_code, timeout=20):
