@@ -636,7 +636,7 @@ class MotionLink:
         # Tk mainloop, and Fusion's modal does not always give focus back.
         start = self.dest_var.get().strip() or self._remembered_dest(self._dest_project or "")
         chosen = filedialog.askdirectory(
-            parent=self.root, title="Where should the audio and job file go?",
+            **ru.dialog_parent(self.root), title="Where should the audio and job file go?",
             initialdir=start if os.path.isdir(start) else None)
         if chosen:
             self.dest_var.set(os.path.normpath(chosen))

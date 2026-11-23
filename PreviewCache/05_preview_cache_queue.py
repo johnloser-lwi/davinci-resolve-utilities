@@ -415,7 +415,7 @@ class PreviewCacheQueue:
     def browse(self):
         start = self.dest_var.get().strip()
         chosen = filedialog.askdirectory(
-            parent=self.root, title="Where should the preview cache renders go?",
+            **ru.dialog_parent(self.root), title="Where should the preview cache renders go?",
             initialdir=start if os.path.isdir(start) else None)
         if chosen:
             self.dest_var.set(os.path.normpath(chosen))
@@ -590,7 +590,7 @@ class PreviewCacheQueue:
             return
         if self.entries and messagebox.askyesno(
                 "Preview Cache Queue", f"Remove all {len(self.entries)} queued range(s)?",
-                parent=self.root):
+                **ru.dialog_parent(self.root)):
             self.entries.clear()
             self.save_queue()
             self.refresh()
@@ -717,7 +717,7 @@ class PreviewCacheQueue:
         self.say(summary, bool(failed))
         if failed:
             messagebox.showwarning("Preview Cache Queue", summary + "\n\n" + "\n\n".join(failed),
-                                   parent=self.root)
+                                   **ru.dialog_parent(self.root))
 
     def _on_close(self):
         if self.running:
@@ -727,7 +727,7 @@ class PreviewCacheQueue:
                 "Preview Cache Queue",
                 "A range is rendering. Click 'Stop After This One', and close once it "
                 "has been placed on the timeline.\n\nWhatever hasn't rendered stays queued "
-                "for next time.", parent=self.root)
+                "for next time.", **ru.dialog_parent(self.root))
             return
         try:
             self.prefs["geometry"] = self.root.geometry()
@@ -747,7 +747,7 @@ def start():
         pc = load_preview_cache()
     except Exception as e:
         root.withdraw()
-        messagebox.showerror("Preview Cache Queue", str(e), parent=root)
+        messagebox.showerror("Preview Cache Queue", str(e), **ru.dialog_parent(root))
         root.destroy()
         return
     SCALE = resolve_scale(prefs, root)

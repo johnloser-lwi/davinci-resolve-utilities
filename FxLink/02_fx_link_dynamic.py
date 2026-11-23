@@ -73,7 +73,7 @@ def show_problems():
             "FxLink",
             "\n\n".join(PROBLEMS)
             + "\n\nMore detail is in Resolve's Console (Workspace > Console).",
-            parent=root)
+            **ru.dialog_parent(root))
         root.destroy()
     except Exception:
         pass

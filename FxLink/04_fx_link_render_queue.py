@@ -448,7 +448,7 @@ class FxLinkQueue:
 
     def clear(self):
         if self.entries and messagebox.askyesno(
-                "FxLink Queue", f"Remove all {len(self.entries)} queued range(s)?", parent=self.root):
+                "FxLink Queue", f"Remove all {len(self.entries)} queued range(s)?", **ru.dialog_parent(self.root)):
             self.entries.clear()
             self.save_queue()
             self.refresh()
@@ -478,7 +478,7 @@ class FxLinkQueue:
         problem = self.preflight()
         if problem:
             self.say(problem, True)
-            messagebox.showwarning("FxLink Queue", problem, parent=self.root)
+            messagebox.showwarning("FxLink Queue", problem, **ru.dialog_parent(self.root))
             return
 
         project = self.project()
@@ -548,7 +548,7 @@ class FxLinkQueue:
         self.say(summary, bool(failed))
         if failed:
             messagebox.showwarning("FxLink Queue", summary + "\n\n" + "\n\n".join(failed),
-                                   parent=self.root)
+                                   **ru.dialog_parent(self.root))
 
     def _on_close(self):
         try:
@@ -568,7 +568,7 @@ def start():
         fx = load_fxlink()
     except Exception as e:
         root.withdraw()
-        messagebox.showerror("FxLink Queue", str(e), parent=root)
+        messagebox.showerror("FxLink Queue", str(e), **ru.dialog_parent(root))
         root.destroy()
         return
     SCALE = resolve_scale(prefs, root)

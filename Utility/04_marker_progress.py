@@ -257,12 +257,12 @@ project = projectManager.GetCurrentProject()
 timeline = project.GetCurrentTimeline() if project else None
 
 if not timeline:
-    messagebox.showwarning("Marker Progress", "No timeline is currently open.")
+    messagebox.showwarning("Marker Progress", "No timeline is currently open.", **ru.dialog_parent())
 else:
     markers = timeline.GetMarkers() or {}
 
     if not markers:
-        messagebox.showinfo("Marker Progress", f"Timeline '{timeline.GetName()}' has no markers.")
+        messagebox.showinfo("Marker Progress", f"Timeline '{timeline.GetName()}' has no markers.", **ru.dialog_parent())
     else:
         # Only offer colors that actually exist on this timeline, most used first
         counts = {}
@@ -291,7 +291,8 @@ else:
         if ignored is None:
             print("Cancelled.")
         elif not included:
-            messagebox.showinfo("Marker Progress", "No marker colors selected — nothing to report.")
+            messagebox.showinfo("Marker Progress", "No marker colors selected — nothing to report.",
+                                **ru.dialog_parent())
         else:
             # Remember exclusions (not inclusions) so unseen colors default to on
             newly_excluded = [c for c, _ in color_counts if c not in included]

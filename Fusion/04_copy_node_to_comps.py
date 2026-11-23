@@ -501,7 +501,7 @@ class CopyNodePanel:
                 f"{len(self.targets)} comp(s)?\n\n"
                 "The node is rebuilt in each comp with the same settings and "
                 "inserted just before MediaOut.",
-                parent=self.root):
+                **ru.dialog_parent(self.root)):
             return
 
         values = read_settings(source["tool"])

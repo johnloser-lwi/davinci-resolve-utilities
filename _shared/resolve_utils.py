@@ -202,10 +202,34 @@ def message(title, text, kind="info"):
         root.withdraw()
         root.attributes("-topmost", True)
         {"info": messagebox.showinfo, "warning": messagebox.showwarning,
-         "error": messagebox.showerror}[kind](title, text, parent=root)
+         "error": messagebox.showerror}[kind](title, text, **dialog_parent(root))
         root.destroy()
     except Exception:
         pass
+
+
+def dialog_parent(window=None):
+    """parent= for a Tk messagebox / file dialog:  messagebox.showinfo(..., **ru.dialog_parent(root))
+
+    On a Mac a dialog with a parent opens as a sheet ATTACHED to that window,
+    so a hidden (withdrawn or minimized) parent leaves it invisible - or stuck
+    where it can't be moved - while the tool waits for a click nobody can make.
+    There the parent is only passed when it's on screen; otherwise the dialog
+    is a normal free-standing window. Also brings this process to the front,
+    since a tool running outside Resolve otherwise opens dialogs behind it.
+    """
+    if window is None:
+        activate_app()
+        return {}
+    if not IS_MAC:
+        return {"parent": window}         # Windows: a topmost parent keeps it above Resolve
+    activate_app()
+    try:
+        if window.winfo_viewable():
+            return {"parent": window}
+    except Exception:
+        pass
+    return {}
 
 
 def ask_directory(fusion=None, initial=None, title="Choose a folder"):
@@ -223,11 +247,12 @@ def ask_directory(fusion=None, initial=None, title="Choose a folder"):
         if parent is None:
             temp = parent = tk.Tk()
             parent.withdraw()
-        activate_app()
+        # A hidden parent would strand a Mac picker - see dialog_parent().
+        options = dialog_parent(parent)
         try:
             start = initial if initial and os.path.isdir(initial) else os.path.expanduser("~")
-            path = filedialog.askdirectory(parent=parent, initialdir=start, title=title,
-                                           mustexist=False)
+            path = filedialog.askdirectory(initialdir=start, title=title, mustexist=False,
+                                           **options)
         finally:
             if temp is not None:
                 temp.destroy()
@@ -247,7 +272,7 @@ def ask_yes_no(title, text):
     root = Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    answer = messagebox.askyesno(title, text, parent=root)
+    answer = messagebox.askyesno(title, text, **dialog_parent(root))
     root.destroy()
     return answer
 

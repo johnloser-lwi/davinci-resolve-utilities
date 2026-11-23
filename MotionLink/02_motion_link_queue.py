@@ -341,7 +341,7 @@ class MotionLinkQueue:
     def browse(self):
         start = self.dest_var.get().strip()
         chosen = filedialog.askdirectory(
-            parent=self.root, title="Where should the audio and job files go?",
+            **ru.dialog_parent(self.root), title="Where should the audio and job files go?",
             initialdir=start if os.path.isdir(start) else None)
         if chosen:
             self.dest_var.set(os.path.normpath(chosen))
@@ -489,7 +489,7 @@ class MotionLinkQueue:
     def clear(self):
         if self.entries and messagebox.askyesno(
                 "Motion Link Queue", f"Remove all {len(self.entries)} queued range(s)?",
-                parent=self.root):
+                **ru.dialog_parent(self.root)):
             self.entries.clear()
             self.save_queue()
             self.refresh()
@@ -581,7 +581,7 @@ class MotionLinkQueue:
         self.say(summary, bool(failed))
         if failed:
             messagebox.showwarning("Motion Link Queue", summary + "\n\n" + "\n\n".join(failed),
-                                   parent=self.root)
+                                   **ru.dialog_parent(self.root))
 
     def _on_close(self):
         try:
@@ -602,7 +602,7 @@ def start():
         ml = load_motion_link()
     except Exception as e:
         root.withdraw()
-        messagebox.showerror("Motion Link Queue", str(e), parent=root)
+        messagebox.showerror("Motion Link Queue", str(e), **ru.dialog_parent(root))
         root.destroy()
         return
     SCALE = resolve_scale(prefs, root)
