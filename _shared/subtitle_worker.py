@@ -629,7 +629,10 @@ def cmd_align(job):
             text = " ".join(texts[i:j])
             if len(text) > max_chars:
                 long_words.append({"time": clause[i]["start"], "text": text})
-            cues.append({"text": text, "start": clause[i]["start"], "word_end": clause[j - 1]["end"]})
+            cues.append({"text": text, "start": clause[i]["start"], "word_end": clause[j - 1]["end"],
+                         # each displayed word with its aligned start (no lead), so the
+                         # Subtitle Edit tab can split a cue exactly at a word
+                         "words": [(part, t["start"]) for t in clause[i:j] for part in t["text"].split()]})
 
     # A cue that starts in silence moves to the first sustained loud frame.
     loud = db > thr
@@ -665,8 +668,10 @@ def cmd_align(job):
         for n, (c, s, e) in enumerate(zip(cues, frames, ends), 1):
             f.write(f"{n}\n{srt_time(s, num, den)} --> {srt_time(e, num, den)}\n{c['text']}\n\n")
     with open(job["cues_json"], "w", encoding="utf-8") as f:
-        json.dump({"fps": [num, den], "cues": [{"f": s, "e": e, "text": c["text"]}
-                                               for c, s, e in zip(cues, frames, ends)]},
+        json.dump({"fps": [num, den], "lead_frames": lead,
+                   "cues": [{"f": s, "e": e, "text": c["text"],
+                             "w": [[part, int(round(t * fps))] for part, t in c["words"]]}
+                            for c, s, e in zip(cues, frames, ends)]},
                   f, ensure_ascii=False, indent=1)
 
     report = [f"{len(cues)} cues, {len(tokens)} words, {snapped} starts snapped to onsets, "

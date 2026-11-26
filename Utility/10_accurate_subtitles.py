@@ -10,7 +10,10 @@ sys.modules.pop("resolve_utils", None)      # Resolve keeps modules loaded betwe
 import resolve_utils as ru
 ru.bootstrap(globals(), "Utility/10_accurate_subtitles.py")     # Mac: opens the window in its own Python
 
+import bisect
+import copy
 import hashlib
+import math
 import json
 import queue
 import re
@@ -19,6 +22,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 # Accurate Subtitles - frame-accurate subtitles for one or many timelines.
@@ -52,6 +56,7 @@ WORKER_NAME = "subtitle_worker.py"
 SUBTITLE_BIN = "Subtitles"
 RESTORE_PRESET = "_AccurateSubtitles_restore"
 NO_PRESET = "(no preset)"
+TREE_TEXT_PAD = 4                         # Treeview cell text inset (clam theme), points
 AUDIO_PRESETS = ("Audio Only",)          # Resolve's built-in audio-only render preset
 RENDER_START_SECONDS = 30                # not rendering this long after Start = never started
 RENDER_FAILED = ("Failed", "Cancelled", "Background Render Cancelled", "Remote Render Cancelled")
@@ -161,6 +166,36 @@ def wav_seconds(path):
     import wave
     with wave.open(path, "rb") as w:
         return w.getnframes() / float(w.getframerate())
+
+
+def frame_to_tc(frame, fps, drop_frame):
+    rate = max(1, round(float(fps)))
+    sep = ":"
+    if drop_frame:
+        drop = 4 if rate == 60 else 2
+        per_min = rate * 60 - drop
+        per_10 = rate * 600 - drop * 9
+        d, m = divmod(frame, per_10)
+        frame += drop * 9 * d
+        if m >= drop:
+            frame += drop * ((m - drop) // per_min)
+        sep = ";"
+    return "%02d:%02d:%02d%s%02d" % ((frame // (rate * 3600)) % 24, (frame // (rate * 60)) % 60,
+                                    (frame // rate) % 60, sep, frame % rate)
+
+
+def srt_time(frame, num, den):
+    # Rounded UP to the millisecond, so Resolve reads it back as the same frame
+    # whether it rounds or truncates.
+    ms = max(0, math.ceil(frame * den * 1000.0 / num - 1e-6))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def is_drop_frame(timeline):
+    return str(timeline.GetSetting("timelineDropFrameTimecode") or "0") == "1"
 
 
 class Stopped(Exception):
@@ -326,6 +361,12 @@ class AccurateSubtitles:
                         relief="flat", font=FONT(8, "bold"))
         style.map("Treeview", background=[("selected", PANEL2)],
                   foreground=[("selected", FG)])
+        style.configure("Edit.Treeview", background=PANEL, fieldbackground=PANEL,
+                        foreground=FG, borderwidth=0, rowheight=S(24), font=FONT(9))
+        style.configure("Edit.Treeview.Heading", background=PANEL2, foreground=SUB,
+                        relief="flat", font=FONT(8, "bold"))
+        style.map("Edit.Treeview", background=[("selected", ACCENT)],
+                  foreground=[("selected", "#ffffff")])
         style.configure("TCombobox", fieldbackground=PANEL, background=BTN,
                         foreground=FG, arrowcolor=SUB, bordercolor=BORDER,
                         lightcolor=PANEL, darkcolor=PANEL, selectbackground=PANEL,
@@ -341,6 +382,11 @@ class AccurateSubtitles:
             style.configure(f"{name}.Horizontal.TProgressbar", troughcolor=PANEL2,
                             background=colour, bordercolor=BORDER, lightcolor=colour,
                             darkcolor=colour, thickness=S(10))
+        style.configure("Dark.TNotebook", background=BG, borderwidth=0, tabmargins=0)
+        style.configure("Dark.TNotebook.Tab", background=PANEL2, foreground=SUB,
+                        padding=(S(10), S(5)), font=FONT(9, "bold"), borderwidth=0)
+        style.map("Dark.TNotebook.Tab", background=[("selected", ACCENT)],
+                  foreground=[("selected", "#ffffff")])
         style.configure("Vertical.TScrollbar", background=BTN, troughcolor=PANEL,
                         bordercolor=PANEL, arrowcolor=SUB, lightcolor=BTN, darkcolor=BTN)
 
@@ -359,7 +405,16 @@ class AccurateSubtitles:
         self.project_label = self._label(head, "", sub=True)
         self.project_label.pack(side="left", padx=S(10))
 
-        body = tk.Frame(outer, bg=BG)
+        # Two tabs: Transcribe (make subtitles) and Subtitle Edit (fix them).
+        self.nb = ttk.Notebook(outer, style="Dark.TNotebook")
+        self.nb.pack(fill="both", expand=True, pady=(S(8), 0))
+        tab = tk.Frame(self.nb, bg=BG)
+        edit_tab = tk.Frame(self.nb, bg=BG)
+        self.nb.add(tab, text="  Transcribe  ")
+        self.nb.add(edit_tab, text="  Subtitle Edit  ")
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.ed_tab_shown())
+
+        body = tk.Frame(tab, bg=BG)
 
         # timelines ---------------------------------------------------------
         left = tk.Frame(body, bg=BG)
@@ -465,7 +520,7 @@ class AccurateSubtitles:
         make_button(wd, "...", self.pick_dir).pack(side="left", padx=(S(6), 0))
 
         # progress ----------------------------------------------------------
-        prog = tk.Frame(outer, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        prog = tk.Frame(tab, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         inner = tk.Frame(prog, bg=PANEL)
         inner.pack(fill="x", padx=S(10), pady=S(8))
 
@@ -489,7 +544,7 @@ class AccurateSubtitles:
                                            maximum=1000, mode="determinate")
         self.overall_bar.pack(fill="x")
 
-        logwrap = tk.Frame(outer, bg=BORDER, padx=1, pady=1)
+        logwrap = tk.Frame(tab, bg=BORDER, padx=1, pady=1)
         self.log_box = tk.Text(logwrap, height=7, bg=PANEL, fg=FG, relief="flat", wrap="word",
                                font=MONO(8), padx=S(6), pady=S(4), highlightthickness=0,
                                state="disabled")
@@ -503,7 +558,7 @@ class AccurateSubtitles:
         self.log_box.tag_configure("bad", foreground=BAD)
         self.log_box.tag_configure("sub", foreground=SUB)
 
-        foot = tk.Frame(outer, bg=BG)
+        foot = tk.Frame(tab, bg=BG)
         self.start_btn = make_button(foot, "Start", self.start, primary=True)
         self.start_btn.pack(side="left")
         self.stop_btn = make_button(foot, "Stop", self.stop)
@@ -517,6 +572,8 @@ class AccurateSubtitles:
         logwrap.pack(side="bottom", fill="x", pady=(S(8), 0))
         prog.pack(side="bottom", fill="x", pady=(S(12), 0))
         body.pack(fill="both", expand=True, pady=(S(10), 0))
+
+        self._build_editor(edit_tab)
 
     # -- client presets ---------------------------------------------------
     # A preset is everything about how a client's subtitles look and read:
@@ -738,6 +795,10 @@ class AccurateSubtitles:
 
     def show(self, job, step, fraction=0.0, detail=""):
         """Current step + its progress, the row's status, the overall bar."""
+        if job not in getattr(self, "jobs", []):            # an edit being applied
+            self.ed_say(detail or step)
+            self.pump()
+            return
         self.current = (job, step)
         job["step"], job["frac"] = step, fraction
         self.set_step(step)
@@ -1308,7 +1369,10 @@ class AccurateSubtitles:
             tl.AddTrack("subtitle")
         folder = subtitle_bin(mp)
         name = os.path.basename(srt)
-        stale = [c for c in folder.GetClipList() or [] if c.GetName() == name]
+        # This timeline's earlier SRTs (first run, edits, retries) come out of
+        # the bin, so it only holds the ones in use.
+        own = re.compile(r"^%s_(final|edited)(_\d{6})?\.srt$" % re.escape(job["id"]), re.I)
+        stale = [c for c in folder.GetClipList() or [] if c.GetName() == name or own.match(c.GetName())]
         if stale:
             mp.DeleteClips(stale)
         mp.SetCurrentFolder(folder)
@@ -1439,6 +1503,580 @@ class AccurateSubtitles:
             time.sleep(0.03)
         return answer["value"]
 
+    # ======================================================================
+    # Subtitle Edit tab
+    # ======================================================================
+    # Edits happen here, not in Resolve - and playback is the timeline's own
+    # exported audio, so nothing touches Resolve until "Apply to Resolve": split a cue at a word, merge cues,
+    # fix text, delete, nudge a start - then "Apply to Resolve" writes an
+    # edited SRT, swaps it in for the old subtitles and checks every frame.
+    # There are never gaps: the cue before always ends where the next starts.
+    # A cue split at a word starts on that word's aligned onset (minus the
+    # lead), using the word times the Transcribe run saved.
+
+    def _build_editor(self, tab):
+        self.ed = {"cues": [], "job": None, "undo": [], "redo": [], "dirty": False}
+        self.ed_timeline_map = {}
+        self._ed_follow_guard = False
+        self._ed_last_name = ""
+
+        top = tk.Frame(tab, bg=BG)
+        top.pack(fill="x", pady=(S(10), 0))
+        self._label(top, "Timeline", sub=True).pack(side="left")
+        self.ed_tl_var = tk.StringVar()
+        self.ed_combo = ttk.Combobox(top, textvariable=self.ed_tl_var, state="readonly",
+                                     width=36, font=FONT(9))
+        self.ed_combo.pack(side="left", padx=(S(6), S(6)))
+        self.ed_combo.bind("<<ComboboxSelected>>", lambda e: self.ed_load())
+        make_button(top, "Reload", self.ed_load).pack(side="left")
+        self.ed_source = self._label(top, "", sub=True)
+        self.ed_source.pack(side="left", padx=S(10))
+        self.ed_audio, self.ed_proc, self.ed_play_state = None, None, None
+        self.ed_autoplay_var = tk.BooleanVar(value=self.prefs.get("edit_autoplay", True))
+
+        wrap = tk.Frame(tab, bg=BORDER, padx=1, pady=1)
+        wrap.pack(fill="both", expand=True, pady=(S(8), S(8)))
+        cols = ("n", "start", "end", "dur", "text", "len")
+        self.ed_tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended",
+                                    style="Edit.Treeview")
+        for col, title, width, stretch, anchor in (
+                ("n", "#", 46, False, "e"), ("start", "Start", 110, False, "w"),
+                ("end", "End", 110, False, "w"), ("dur", "Frames", 60, False, "e"),
+                ("text", "Text", 420, True, "w"), ("len", "Chars", 52, False, "e")):
+            self.ed_tree.heading(col, text=title)
+            self.ed_tree.column(col, width=S(width), stretch=stretch, anchor=anchor)
+        self.ed_tree.tag_configure("long", foreground=WARN)
+        self.ed_tree.tag_configure("short", foreground=BAD)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.ed_tree.yview)
+        self.ed_tree.configure(yscrollcommand=sb.set)
+        self.ed_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.ed_tree.bind("<<TreeviewSelect>>", lambda e: self.ed_on_select())
+        mod = "Command" if ru.IS_MAC else "Control"
+        for seq, fn in ((f"<{mod}-z>", self.ed_undo), (f"<{mod}-Z>", self.ed_redo),
+                        (f"<{mod}-Shift-z>", self.ed_redo), ("e", self.ed_merge), ("E", self.ed_merge),
+                        ("bracketleft", lambda: self.ed_nudge(-1)),
+                        ("bracketright", lambda: self.ed_nudge(1)),
+                        ("space", self.ed_toggle_play), ("p", self.ed_play_selected)):
+            self.ed_tree.bind(seq if seq.startswith("<") or len(seq) == 1 else f"<{seq}>",
+                              lambda e, fn=fn: (fn(), "break")[1])
+        ru.bind_delete(self.ed_tree, lambda e=None: self.ed_delete())
+        # Right-click a word in the Text column: split the cue just before it.
+        for seq in ("<Button-2>", "<Button-3>") + (("<Control-Button-1>",) if ru.IS_MAC else ()):
+            self.ed_tree.bind(seq, self.ed_right_click)
+
+        panel = tk.Frame(tab, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        panel.pack(fill="x")
+        inner = tk.Frame(panel, bg=PANEL)
+        inner.pack(fill="x", padx=S(10), pady=S(8))
+
+        row = tk.Frame(inner, bg=PANEL)
+        row.pack(fill="x")
+        self._label(row, "Text", sub=True, bg=PANEL).pack(side="left")
+        self.ed_text_var = tk.StringVar()
+        self.ed_entry = entry(row, self.ed_text_var, font=FONT(11))
+        self.ed_entry.pack(side="left", fill="x", expand=True, padx=(S(8), S(6)), ipady=S(4))
+        self.ed_entry.bind("<Return>", lambda e: self.ed_apply_text())
+        self.ed_entry.bind(f"<{mod}-Return>", lambda e: (self.ed_split_at_cursor(), "break")[1])
+        make_button(row, "Apply Text", self.ed_apply_text).pack(side="left")
+        make_button(row, "Split at Cursor", self.ed_split_at_cursor).pack(side="left", padx=(S(6), 0))
+
+        self._label(inner, "Click a word to split the cue just before it (or right-click the word "
+                           "in the list above):", sub=True,
+                    bg=PANEL).pack(fill="x", pady=(S(8), S(3)))
+        self.ed_words_frame = tk.Frame(inner, bg=PANEL, height=S(30))
+        self.ed_words_frame.pack(fill="x")
+
+        play = tk.Frame(inner, bg=PANEL)
+        play.pack(fill="x", pady=(S(10), 0))
+        self.ed_play_btn = make_button(play, "\u25b6 Play From Cue (Space)", self.ed_toggle_play)
+        self.ed_play_btn.pack(side="left")
+        make_button(play, "Play Cue (P)", self.ed_play_selected).pack(side="left", padx=(S(6), 0))
+        make_button(play, "\u25a0 Stop", self.ed_stop).pack(side="left", padx=(S(6), 0))
+        tk.Checkbutton(play, text="Play a cue when it's selected", variable=self.ed_autoplay_var,
+                       bg=PANEL, fg=FG, selectcolor=PANEL2, activebackground=PANEL,
+                       activeforeground=FG, font=FONT(9), highlightthickness=0
+                       ).pack(side="left", padx=(S(12), 0))
+
+        btns = tk.Frame(inner, bg=PANEL)
+        btns.pack(fill="x", pady=(S(8), 0))
+        for text, fn in (("Merge (E)", self.ed_merge), ("Delete", self.ed_delete),
+                         ("◀ Start −1f  [", lambda: self.ed_nudge(-1)),
+                         ("Start +1f ▶  ]", lambda: self.ed_nudge(1)),
+                         ("Undo", self.ed_undo), ("Redo", self.ed_redo)):
+            make_button(btns, text, fn).pack(side="left", padx=(0, S(6)))
+        self.ed_apply_btn = make_button(btns, "Apply to Resolve", self.ed_apply, primary=True)
+        self.ed_apply_btn.pack(side="right")
+        self.ed_status = self._label(inner, "Pick a timeline to edit its subtitles.", sub=True, bg=PANEL)
+        self.ed_status.pack(fill="x", pady=(S(8), 0))
+
+        self.root.after(400, self.ed_poll)
+
+    def ed_say(self, text, colour=None):
+        self.ed_status.config(text=text, fg=colour or SUB)
+
+    # -- loading -----------------------------------------------------------
+    def ed_tab_shown(self):
+        try:
+            if self.nb.index("current") != 1:
+                return
+        except tk.TclError:
+            return
+        project = self.project()
+        if not project:
+            return
+        self.ed_timeline_map = {}
+        for tl, _bin in timelines_with_bins(project):
+            name, n = tl.GetName(), 2
+            while name in self.ed_timeline_map:
+                name, n = f"{tl.GetName()} ({n})", n + 1
+            self.ed_timeline_map[name] = tl
+        self.ed_combo["values"] = list(self.ed_timeline_map)
+        if not self.ed["job"]:
+            current = project.GetCurrentTimeline()
+            cur_id = current.GetUniqueId() if current else None
+            for name, tl in self.ed_timeline_map.items():
+                if tl.GetUniqueId() == cur_id:
+                    self.ed_tl_var.set(name)
+                    self.ed_load()
+                    break
+
+    def ed_load(self):
+        name = self.ed_tl_var.get()
+        tl = self.ed_timeline_map.get(name)
+        if not tl:
+            return
+        if self.ed["dirty"] and not messagebox.askyesno(
+                "Subtitle Edit", "Your edits haven't been applied to Resolve. Discard them?",
+                **ru.dialog_parent(self.root)):
+            self.ed_tl_var.set(self._ed_last_name)
+            return
+        project = self.project()
+        start = int(tl.GetStartFrame())
+        jid = sanitize(tl.GetName())
+        work = self.dir_var.get().strip() or guess_work_dir(project, [tl])
+        dirs = {k: os.path.join(work, k) for k in ("renders", "wav", "words", "subtitles")}
+        cues_path = os.path.join(dirs["words"], jid + "_cues.json")
+        data = ru.read_json(cues_path, {}) or {}
+        saved = [dict(c) for c in data.get("cues") or []]
+        on_tl = [{"f": int(round(i.GetStart())) - start, "e": int(round(i.GetEnd())) - start,
+                  "text": " ".join((i.GetName() or "").split())}
+                 for i in sorted(subtitle_items(tl), key=lambda i: i.GetStart())]
+
+        def same(a, b):
+            return len(a) == len(b) and all(x["f"] == y["f"] and x["text"] == y["text"]
+                                             for x, y in zip(a, b))
+
+        if saved and (not on_tl or same(saved, on_tl)):
+            cues, source = saved, "word timing available"
+        elif on_tl:
+            # Edited in Resolve since: the timeline wins, word times are kept
+            # for the cues that still match.
+            times = {(c["f"], c["text"]): c.get("w") for c in saved}
+            cues = [dict(c, w=times.get((c["f"], c["text"]))) for c in on_tl]
+            source = "read from the timeline" + (" (changed in Resolve since the run)" if saved else "")
+        else:
+            cues, source = [], ""
+        num, den = fps_fraction(tl)
+        self.ed.update(cues=cues, undo=[], redo=[], dirty=False, job={
+            "tl": tl, "name": tl.GetName(), "id": jid, "start": start, "fps": (num, den),
+            "drop": is_drop_frame(tl), "dirs": dirs, "cues_path": cues_path,
+            "lead": float(data.get("lead_frames", self.lead_var.get() or 4))})
+        self._ed_last_name = name
+        if cues and not self.ed_load_audio(self.ed["job"]):
+            source += " \u00b7 no exported audio to play"
+        self.ed_source.config(text=source)
+        self.ed_draw()
+        if cues:
+            self.ed_say(f"{len(cues)} cues. Right-click a word to split before it; select cues and "
+                        f"press E to merge; [ ] move a start a frame; Space plays on from the cue.")
+        else:
+            self.ed_say("No subtitles on this timeline yet - make them on the Transcribe tab.", WARN)
+
+    # -- drawing -----------------------------------------------------------
+    def ed_selected(self):
+        return sorted(int(i) for i in self.ed_tree.selection())
+
+    def ed_draw(self, select=None):
+        job, cues = self.ed["job"], self.ed["cues"]
+        keep = select if select is not None else self.ed_selected()
+        self.ed_tree.delete(*self.ed_tree.get_children())
+        if not job:
+            return
+        try:
+            limit = int(self.max_var.get())
+        except ValueError:
+            limit = 14
+        fps = job["fps"][0] / job["fps"][1]
+        for i, c in enumerate(cues):
+            n = len(c["text"])
+            tag = "short" if c["e"] - c["f"] < 2 else ("long" if n > limit else "")
+            self.ed_tree.insert("", "end", iid=str(i), tags=(tag,) if tag else (), values=(
+                i + 1, frame_to_tc(job["start"] + c["f"], fps, job["drop"]),
+                frame_to_tc(job["start"] + c["e"], fps, job["drop"]), c["e"] - c["f"], c["text"], n))
+        keep = [i for i in (keep if isinstance(keep, list) else [keep]) if 0 <= i < len(cues)]
+        if keep:
+            self._ed_follow_guard = True          # a redraw is not a click
+            self.ed_tree.selection_set([str(i) for i in keep])
+            self.ed_tree.see(str(keep[0]))
+        self.ed_fill_editor()
+        state = " • edited - not applied yet" if self.ed["dirty"] else ""
+        self.ed_apply_btn.config(text="Apply to Resolve" + (" ●" if self.ed["dirty"] else ""))
+        if state:
+            self.ed_source.config(text=self.ed_source.cget("text").split(" • ")[0] + state)
+
+    def ed_fill_editor(self):
+        sel = self.ed_selected()
+        for w in self.ed_words_frame.winfo_children():
+            w.destroy()
+        if len(sel) != 1:
+            self.ed_text_var.set("")
+            return
+        i = sel[0]
+        cue = self.ed["cues"][i]
+        self.ed_text_var.set(cue["text"])
+        words, _real = self.ed_words(cue)
+        for k, (word, _f) in enumerate(words):
+            lbl = tk.Label(self.ed_words_frame, text=word, bg=PANEL2, fg=FG if k else SUB,
+                           font=FONT(10), padx=S(7), pady=S(3), cursor="hand2" if k else "")
+            lbl.pack(side="left", padx=(0, S(4)))
+            if k:
+                lbl.bind("<Enter>", lambda e, l=lbl: l.config(bg=ACCENT, fg="#ffffff"))
+                lbl.bind("<Leave>", lambda e, l=lbl: l.config(bg=PANEL2, fg=FG))
+                lbl.bind("<Button-1>", lambda e, i=i, k=k: self.ed_split(i, k))
+
+    def ed_right_click(self, event):
+        """Split the cue before the word under the mouse (on the first word:
+        after it)."""
+        iid = self.ed_tree.identify_row(event.y)
+        if not iid:
+            return "break"
+        i = int(iid)
+        if self.ed_tree.identify_column(event.x) != "#5":          # not the Text column
+            self.ed_tree.selection_set(iid)
+            return "break"
+        box = self.ed_tree.bbox(iid, "text")
+        words, _real = self.ed_words(self.ed["cues"][i])
+        if not box or len(words) < 2:
+            self.ed_tree.selection_set(iid)
+            self.ed_say("A single word can't be split.", BAD)
+            return "break"
+        measure = tkfont.Font(font=FONT(9)).measure
+        x = event.x - box[0] - S(TREE_TEXT_PAD)
+        space, pos, k = measure(" "), 0, len(words) - 1
+        for idx, (word, _f) in enumerate(words):
+            width = measure(word)
+            if x < pos + width + space / 2:
+                k = idx
+                break
+            pos += width + space
+        self.ed_split(i, max(1, k))
+        return "break"
+
+    def ed_words(self, cue):
+        """[(word, frame)] for a cue, and whether the frames are real aligned
+        word starts (else spread over the cue by character position)."""
+        toks = cue["text"].split()
+        w = cue.get("w")
+        if w and [x[0] for x in w] == toks:
+            return [(x[0], int(x[1])) for x in w], True
+        out, pos, total = [], 0, max(1, len(cue["text"]))
+        for t in toks:
+            at = cue["text"].index(t, pos)
+            out.append((t, cue["f"] + int(round((cue["e"] - cue["f"]) * at / total))))
+            pos = at + len(t)
+        return out, False
+
+    # -- playback (the timeline's own exported audio, no Resolve needed) -----
+    def ed_load_audio(self, job):
+        import wave
+        self.ed_stop()
+        self.ed_audio = None
+        path = os.path.join(job["dirs"]["wav"], job["id"] + ".wav")
+        if not os.path.isfile(path):
+            return False
+        try:
+            with wave.open(path, "rb") as w:
+                self.ed_audio = {"params": w.getparams(), "rate": w.getframerate(),
+                                 "width": w.getsampwidth() * w.getnchannels(),
+                                 "data": w.readframes(w.getnframes())}
+        except Exception:
+            self.ed_audio = None
+        return self.ed_audio is not None
+
+    def ed_on_select(self):
+        self.ed_fill_editor()
+        if self._ed_follow_guard:
+            self._ed_follow_guard = False
+            return
+        sel = self.ed_selected()
+        if len(sel) == 1 and self.ed_autoplay_var.get():
+            self.ed_play(sel[0], sel[0])
+
+    def ed_play_selected(self):
+        sel = self.ed_selected()
+        if sel:
+            self.ed_play(sel[0], sel[-1])
+
+    def ed_toggle_play(self):
+        if self.ed_play_state and self.ed_play_state.get("follow"):
+            self.ed_stop()
+            return
+        sel = self.ed_selected()
+        if self.ed["cues"]:
+            self.ed_play(sel[0] if sel else 0, None)
+
+    def ed_play(self, first, last=None):
+        """Play from cue `first` to the end of cue `last` (None: to the end,
+        with the list following along)."""
+        import wave
+        self.ed_stop()
+        job, cues, a = self.ed["job"], self.ed["cues"], self.ed_audio
+        if not a or not cues:
+            if job and not a:
+                self.ed_say("No exported audio for this timeline - it's made by a Transcribe run.", WARN)
+            return
+        fps = job["fps"][0] / job["fps"][1]
+        t0 = cues[first]["f"] / fps
+        b0 = int(t0 * a["rate"]) * a["width"]
+        b1 = int(cues[last]["e"] / fps * a["rate"]) * a["width"] if last is not None else len(a["data"])
+        if b1 <= b0:
+            return
+        path = ru.data_path("subtitle_edit_preview.wav")
+        try:
+            with wave.open(path, "wb") as w:
+                w.setparams(a["params"])
+                w.writeframes(a["data"][b0:b1])
+            self.ed_proc = subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.ed_say(f"Couldn't play the audio: {e}", BAD)
+            return
+        self.ed_play_state = {"t0": time.time(), "offset": t0, "follow": last is None}
+        if last is None:
+            self.ed_play_btn.config(text="\u25a0 Stop (Space)")
+
+    def ed_stop(self):
+        proc, self.ed_proc, self.ed_play_state = self.ed_proc, None, None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            self.ed_play_btn.config(text="\u25b6 Play From Cue (Space)")
+        except Exception:
+            pass
+
+    def ed_poll(self):
+        """While playing on, keep the cue being heard selected."""
+        try:
+            state, job, cues = self.ed_play_state, self.ed["job"], self.ed["cues"]
+            if state:
+                if self.ed_proc is None or self.ed_proc.poll() is not None:
+                    self.ed_stop()
+                elif state["follow"] and job and cues:
+                    fps = job["fps"][0] / job["fps"][1]
+                    f = (state["offset"] + time.time() - state["t0"]) * fps
+                    i = bisect.bisect_right([c["f"] for c in cues], f) - 1
+                    if 0 <= i < len(cues) and self.ed_selected() != [i]:
+                        self._ed_follow_guard = True
+                        self.ed_tree.selection_set(str(i))
+                        self.ed_tree.see(str(i))
+        except Exception:
+            pass
+        finally:
+            try:
+                self.root.after(60, self.ed_poll)
+            except tk.TclError:
+                pass
+
+    # -- edits ---------------------------------------------------------------
+    def ed_snapshot(self):
+        self.ed["undo"].append(copy.deepcopy(self.ed["cues"]))
+        del self.ed["undo"][:-200]
+        self.ed["redo"] = []
+        self.ed["dirty"] = True
+
+    def ed_undo(self):
+        if self.ed["undo"]:
+            self.ed["redo"].append(copy.deepcopy(self.ed["cues"]))
+            self.ed["cues"] = self.ed["undo"].pop()
+            self.ed["dirty"] = True
+            self.ed_draw()
+            self.ed_say("Undone.")
+
+    def ed_redo(self):
+        if self.ed["redo"]:
+            self.ed["undo"].append(copy.deepcopy(self.ed["cues"]))
+            self.ed["cues"] = self.ed["redo"].pop()
+            self.ed["dirty"] = True
+            self.ed_draw()
+            self.ed_say("Redone.")
+
+    def ed_split(self, i, k):
+        cues = self.ed["cues"]
+        cue = cues[i]
+        words, real = self.ed_words(cue)
+        if not 0 < k < len(words):
+            return
+        if cue["e"] - cue["f"] < 4:
+            self.ed_say("That cue is too short to split (each half needs 2 frames).", BAD)
+            return
+        f = words[k][1] - (int(round(self.ed["job"]["lead"])) if real else 0)
+        f = max(cue["f"] + 2, min(cue["e"] - 2, f))
+        self.ed_snapshot()
+        first = {"f": cue["f"], "e": f, "text": " ".join(w for w, _ in words[:k]),
+                 "w": [list(x) for x in words[:k]] if real else None}
+        second = {"f": f, "e": cue["e"], "text": " ".join(w for w, _ in words[k:]),
+                  "w": [list(x) for x in words[k:]] if real else None}
+        cues[i:i + 1] = [first, second]
+        self.ed_draw(select=[i + 1])
+        how = "on the word's onset" if real else "estimated from the text (no word timing)"
+        self.ed_say(f"Split cue {i + 1} before '{words[k][0]}' - {how}.")
+
+    def ed_split_at_cursor(self):
+        sel = self.ed_selected()
+        if len(sel) != 1:
+            self.ed_say("Select one cue to split.", BAD)
+            return
+        text, cursor = self.ed_text_var.get(), self.ed_entry.index("insert")
+        if " ".join(text.split()) != self.ed["cues"][sel[0]]["text"]:
+            self.ed_apply_text()
+        # The cursor anywhere in a word splits just before that word.
+        before = text[:cursor]
+        k = len(before.split()) if (not before or before.endswith(" ")) else len(before.split()) - 1
+        if cursor >= len(text.rstrip()):
+            k = len(text.split())
+        self.ed_split(sel[0], k)
+
+    def ed_merge(self):
+        sel = self.ed_selected()
+        cues = self.ed["cues"]
+        if len(sel) == 1 and sel[0] + 1 < len(cues):
+            sel = [sel[0], sel[0] + 1]
+        if len(sel) < 2:
+            self.ed_say("Select two or more cues next to each other to merge.", BAD)
+            return
+        if sel != list(range(sel[0], sel[-1] + 1)):
+            self.ed_say("Only cues next to each other can be merged.", BAD)
+            return
+        self.ed_snapshot()
+        part = cues[sel[0]:sel[-1] + 1]
+        words = [self.ed_words(c) for c in part]
+        merged = {"f": part[0]["f"], "e": part[-1]["e"],
+                  "text": " ".join(c["text"] for c in part),
+                  "w": [list(x) for w, real in words for x in w] if all(r for _, r in words) else None}
+        cues[sel[0]:sel[-1] + 1] = [merged]
+        self.ed_draw(select=[sel[0]])
+        self.ed_say(f"Merged {len(part)} cues into cue {sel[0] + 1}.")
+
+    def ed_delete(self):
+        sel = self.ed_selected()
+        cues = self.ed["cues"]
+        if not sel:
+            return
+        self.ed_snapshot()
+        for i in reversed(sel):
+            if i > 0 and cues[i - 1]["e"] == cues[i]["f"]:
+                cues[i - 1]["e"] = cues[i]["e"]          # no gap: the cue before stays up
+            del cues[i]
+        self.ed_draw(select=[max(0, sel[0] - 1)] if cues else [])
+        self.ed_say(f"Deleted {len(sel)} cue(s); the cue before each one now stays up in its place.")
+
+    def ed_nudge(self, delta):
+        sel = self.ed_selected()
+        if len(sel) != 1:
+            self.ed_say("Select one cue to move its start.", BAD)
+            return
+        i = sel[0]
+        cues = self.ed["cues"]
+        lo = cues[i - 1]["f"] + 2 if i > 0 else 0
+        new = max(lo, min(cues[i]["e"] - 2, cues[i]["f"] + delta))
+        if new == cues[i]["f"]:
+            self.ed_say("It can't move further (cues need at least 2 frames).", BAD)
+            return
+        self.ed_snapshot()
+        if i > 0 and cues[i - 1]["e"] == cues[i]["f"]:
+            cues[i - 1]["e"] = new
+        cues[i]["f"] = new
+        self.ed_draw(select=[i])
+        if self.ed_autoplay_var.get():
+            self.ed_play(i, i)
+        self.ed_say(f"Cue {i + 1} starts {'earlier' if delta < 0 else 'later'} by 1 frame.")
+
+    def ed_apply_text(self):
+        sel = self.ed_selected()
+        if len(sel) != 1:
+            return
+        cue = self.ed["cues"][sel[0]]
+        text = " ".join(self.ed_text_var.get().split())
+        if not text or text == cue["text"]:
+            return
+        self.ed_snapshot()
+        words, real = self.ed_words(cue)
+        new = text.split()
+        cue["w"] = [[t, f] for t, (_, f) in zip(new, words)] if real and len(new) == len(words) else None
+        cue["text"] = text
+        self.ed_draw(select=[sel[0]])
+        self.ed_say(f"Cue {sel[0] + 1} text changed.")
+
+    # -- apply -----------------------------------------------------------------
+    def ed_apply(self):
+        job, cues = self.ed["job"], self.ed["cues"]
+        if not job or not cues:
+            return
+        if self.running:
+            self.ed_say("Wait for the Transcribe run to finish first.", BAD)
+            return
+        for i, c in enumerate(cues):
+            if c["e"] - c["f"] < 2 or not c["text"].strip() or (i and c["f"] < cues[i - 1]["f"] + 2):
+                self.ed_select_and_say(i, f"Cue {i + 1} is shorter than 2 frames or empty - "
+                                          f"Resolve would drop it. Fix it first.")
+                return
+        num, den = job["fps"]
+        os.makedirs(job["dirs"]["subtitles"], exist_ok=True)
+        os.makedirs(job["dirs"]["words"], exist_ok=True)
+        srt = os.path.join(job["dirs"]["subtitles"], job["id"] + "_edited.srt")
+        with open(srt, "w", encoding="utf-8") as f:
+            for n, c in enumerate(cues, 1):
+                f.write(f"{n}\n{srt_time(c['f'], num, den)} --> {srt_time(c['e'], num, den)}\n"
+                        f"{c['text']}\n\n")
+        if os.path.isfile(job["cues_path"]):
+            orig = job["cues_path"].replace("_cues.json", "_cues_orig.json")
+            if not os.path.exists(orig):
+                os.replace(job["cues_path"], orig)          # the run's own cues, kept once
+        ru.write_json(job["cues_path"], {"fps": [num, den], "lead_frames": job["lead"],
+                                         "cues": cues, "edited": True})
+        self.ed_apply_btn.config(state="disabled")
+        try:
+            project = self.project()
+            self.import_srt(project, job, srt, cues)
+            problems = self.verify(job, cues)
+            projectManager.SaveProject()
+        except StepError as e:
+            self.ed_say(f"Couldn't apply: {e}", BAD)
+            return
+        except Exception as e:
+            self.ed_say(f"Couldn't apply: {e}", BAD)
+            self.log(traceback.format_exc(), "bad")
+            return
+        finally:
+            self.ed_apply_btn.config(state="normal")
+        self.ed["dirty"] = False
+        self.ed_draw()
+        self.ed_source.config(text="word timing available")
+        if problems:
+            self.ed_say("Applied, but: " + "; ".join(problems[:3]), BAD)
+        else:
+            self.ed_say(f"Applied: {len(cues)} cues on the timeline, every one on its exact frame, "
+                        f"no gaps.", GOOD)
+
+    def ed_select_and_say(self, i, text):
+        self.ed_tree.selection_set(str(i))
+        self.ed_tree.see(str(i))
+        self.ed_say(text, BAD)
+
     # -- stop / close -------------------------------------------------------
     def stop(self):
         if self.running:
@@ -1446,6 +2084,10 @@ class AccurateSubtitles:
             self.step_text.config(text="Stopping...")
 
     def _on_close(self):
+        if getattr(self, "ed", {}).get("dirty") and not messagebox.askyesno(
+                "Accurate Subtitles", "The subtitle edits haven't been applied to Resolve. "
+                "Close anyway and lose them?", **ru.dialog_parent(self.root)):
+            return
         if self.running:
             if not messagebox.askyesno("Accurate Subtitles", "Subtitles are being made. Stop and close?",
                                        **ru.dialog_parent(self.root)):
@@ -1456,6 +2098,11 @@ class AccurateSubtitles:
                     self.proc.terminate()
                 except Exception:
                     pass
+        try:
+            self.ed_stop()
+            self.prefs["edit_autoplay"] = self.ed_autoplay_var.get()
+        except Exception:
+            pass
         try:
             self.read_settings()
         except Exception:
