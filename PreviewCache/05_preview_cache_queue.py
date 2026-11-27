@@ -22,6 +22,8 @@ from tkinter import filedialog, messagebox, ttk
 #      whole video into four sections.
 #      Or let it split for you: "Split into N sections" queues the whole
 #      timeline (or the current In/Out) as N equal, back-to-back sections.
+#      Or queue the markers: "Queue Uncached Markers" queues every range marker
+#      (optionally of one colour) that no preview cache clip covers yet.
 #   2. Click "Render Queue". The sections render ONE AT A TIME: each is rendered,
 #      imported and placed on the timeline (green, above the range) before the
 #      next one starts.
@@ -52,6 +54,9 @@ BTN_HOVER = "#454545"
 ACCENT = "#3d7fd6"
 ACCENT_HOVER = "#4a90e8"
 BAD = "#e07070"
+
+CACHE_COLORS = ("Green", "Chocolate")     # cache clips: shown / hidden by Toggle (04)
+ALL_COLOURS = "All colours"
 
 SCALE_CHOICES = ["Auto", "100%", "125%", "150%", "175%", "200%", "250%"]
 SCALE = 1.0
@@ -321,6 +326,21 @@ class PreviewCacheQueue:
                                            lambda: self.add_sections(whole=False))
         self.split_range_btn.pack(side="left", padx=(S(6), 0))
 
+        tk.Label(form, text="Markers", bg=BG, fg=SUB, font=FONT(9), width=11,
+                 anchor="w").grid(row=3, column=0, sticky="w", pady=(S(6), 0))
+        marker_row = tk.Frame(form, bg=BG)
+        marker_row.grid(row=3, column=1, sticky="ew", pady=(S(6), 0))
+        self.marker_color_var = tk.StringVar(value=self.prefs.get("marker_color", ALL_COLOURS))
+        self.marker_box = ttk.Combobox(marker_row, textvariable=self.marker_color_var,
+                                       values=[ALL_COLOURS], state="readonly", width=14,
+                                       font=FONT(9))
+        self.marker_box.pack(side="left")
+        self.marker_box.bind("<<ComboboxSelected>>", lambda e: self.show_in_out())
+        self.markers_btn = make_button(marker_row, "Queue Uncached Markers", self.add_markers)
+        self.markers_btn.pack(side="left", padx=(S(8), 0))
+        self.marker_info = tk.Label(marker_row, text="", bg=BG, fg=SUB, font=FONT(8))
+        self.marker_info.pack(side="left", padx=(S(8), 0))
+
         table = tk.Frame(self.root, bg=BG)
         table.pack(fill="both", expand=True, padx=S(14), pady=(S(10), 0))
         cols = ("n", "timeline", "range", "frames", "preset", "status")
@@ -432,6 +452,7 @@ class PreviewCacheQueue:
         if not timeline:
             self.inout_label.config(text="No timeline open")
             return
+        self.show_markers(timeline)
         marks = self.read_in_out(timeline)
         if marks:
             a, b = self.describe_range(timeline, *marks)
@@ -463,7 +484,8 @@ class PreviewCacheQueue:
             tag = ("active",) if status.startswith("rendering") else \
                   ("failed",) if status not in ("queued",) else ()
             self.tree.insert("", "end", iid=entry["id"], tags=tag,
-                             values=(n, entry.get("timeline", ""),
+                             values=(n, entry.get("timeline", "") + (f"  \u00b7  {entry['marker']}"
+                                                                     if entry.get("marker") else ""),
                                      f"{entry.get('in_tc')}  -  {entry.get('out_tc')}",
                                      entry["out"] - entry["in"] + 1,
                                      entry.get("preset", ""), status))
@@ -491,6 +513,118 @@ class PreviewCacheQueue:
         self.save_queue()
         self.refresh()
         self.say(f"Queued {in_tc} - {out_tc} on '{timeline.GetName()}'.")
+
+    # -- markers ----------------------------------------------------------
+    @staticmethod
+    def range_markers(timeline):
+        """[(in, out, colour, name)] for the timeline's range markers (longer
+        than one frame), relative to the timeline start like In/Out."""
+        out = []
+        for frame, m in (timeline.GetMarkers() or {}).items():
+            duration = int(float(m.get("duration") or 1))
+            if duration > 1:
+                first = int(float(frame))
+                out.append((first, first + duration - 1, m.get("color") or "", m.get("name") or ""))
+        return sorted(out)
+
+    @staticmethod
+    def cache_spans(timeline):
+        """Merged [(first, last)] frames covered by preview cache clips."""
+        start = timeline.GetStartFrame()
+        spans = []
+        for track in range(1, (timeline.GetTrackCount("video") or 0) + 1):
+            for item in timeline.GetItemListInTrack("video", track) or []:
+                try:
+                    if item.GetClipColor() in CACHE_COLORS:
+                        spans.append((int(item.GetStart()) - start, int(item.GetEnd()) - start - 1))
+                except Exception:
+                    pass
+        merged = []
+        for a, b in sorted(spans):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        return merged
+
+    @staticmethod
+    def covered(first, last, spans):
+        """Whether cache clips cover every frame from first to last."""
+        for a, b in spans:
+            if a <= first <= b:
+                if b >= last:
+                    return True
+                first = b + 1
+        return False
+
+    def show_markers(self, timeline):
+        try:
+            markers = self.range_markers(timeline)
+            spans = self.cache_spans(timeline)
+        except Exception:
+            return
+        colours = sorted({c for _, _, c, _ in markers if c})
+        self.marker_box.config(values=[ALL_COLOURS] + colours)
+        wanted = self.marker_color_var.get()
+        if wanted != ALL_COLOURS and wanted not in colours and colours:
+            self.marker_color_var.set(ALL_COLOURS)
+            wanted = ALL_COLOURS
+        picked = [m for m in markers if wanted == ALL_COLOURS or m[2] == wanted]
+        todo = [(a, b) for a, b, _, _ in picked if not self.covered(a, b, spans)]
+        try:
+            key = timeline.GetUniqueId() or timeline.GetName()
+        except Exception:
+            key = timeline.GetName()
+        queued = {(e.get("timeline_id") or e.get("timeline"), e["in"], e["out"]) for e in self.entries}
+        in_queue = sum(1 for a, b in todo if (key, a, b) in queued)
+        text = f"{len(todo)} of {len(picked)} range marker(s) uncached" + (
+            f", {in_queue} queued" if in_queue else "")
+        self.marker_info.config(text=text if picked else "no range markers on this timeline")
+
+    def add_markers(self):
+        """Queue every range marker (of the chosen colour) that preview cache
+        clips don't already cover. Point markers have no range and are left out."""
+        project = self.project()
+        timeline = project.GetCurrentTimeline() if project else None
+        if not timeline:
+            self.say("Open a timeline first.", True)
+            return
+        preset = self.preset_var.get()
+        if not preset:
+            self.say("Choose a render preset first.", True)
+            return
+        colour = self.marker_color_var.get()
+        self.prefs["marker_color"] = colour
+        write_json(WINDOW_PREFS_FILE, self.prefs)
+        try:
+            timeline_id = timeline.GetUniqueId()
+        except Exception:
+            timeline_id = ""
+        queued = {(e.get("timeline_id") or e.get("timeline"), e["in"], e["out"]) for e in self.entries}
+        spans = self.cache_spans(timeline)
+        added = cached = already = 0
+        for first, last, c, name in self.range_markers(timeline):
+            if colour != ALL_COLOURS and c != colour:
+                continue
+            if self.covered(first, last, spans):
+                cached += 1
+            elif (timeline_id or timeline.GetName(), first, last) in queued:
+                already += 1
+            else:
+                self._queue_range(timeline, first, last, preset)
+                self.entries[-1]["marker"] = name or f"{c} marker"
+                added += 1
+        self.save_queue()
+        self.refresh()
+        which = "" if colour == ALL_COLOURS else f"{colour} "
+        extra = ", ".join(x for x in (f"{cached} already cached" if cached else "",
+                                      f"{already} already queued" if already else "") if x)
+        if added:
+            self.say(f"Queued {added} {which}marker range(s) from '{timeline.GetName()}'"
+                     + (f" ({extra})." if extra else "."))
+        else:
+            self.say(f"No {which}range markers need a cache" + (f" ({extra})." if extra else "."),
+                     not extra)
 
     def _queue_range(self, timeline, mark_in, mark_out, preset):
         in_tc, out_tc = self.describe_range(timeline, mark_in, mark_out)
