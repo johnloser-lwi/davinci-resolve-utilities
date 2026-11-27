@@ -184,14 +184,26 @@ def frame_to_tc(frame, fps, drop_frame):
                                     (frame // rate) % 60, sep, frame % rate)
 
 
-def srt_time(frame, num, den):
+def srt_time(frame, num, den, sep=","):
     # Rounded UP to the millisecond, so Resolve reads it back as the same frame
     # whether it rounds or truncates.
     ms = max(0, math.ceil(frame * den * 1000.0 / num - 1e-6))
     h, ms = divmod(ms, 3600000)
     m, ms = divmod(ms, 60000)
     sec, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+    return f"{h:02d}:{m:02d}:{sec:02d}{sep}{ms:03d}"
+
+
+def subtitle_file_text(cues, num, den, fmt):
+    """The cues as an SRT or WebVTT file. Times count from the start of the
+    timeline (0:00), the way a video exported from it plays."""
+    vtt = fmt.upper() == "VTT"
+    lines = ["WEBVTT", ""] if vtt else []
+    for n, c in enumerate(cues, 1):
+        a = srt_time(c["f"], num, den, "." if vtt else ",")
+        b = srt_time(c["e"], num, den, "." if vtt else ",")
+        lines += [str(n), f"{a} --> {b}", c["text"], ""]
+    return "\n".join(lines)
 
 
 def is_drop_frame(timeline):
@@ -1597,6 +1609,11 @@ class AccurateSubtitles:
                        bg=PANEL, fg=FG, selectcolor=PANEL2, activebackground=PANEL,
                        activeforeground=FG, font=FONT(9), highlightthickness=0
                        ).pack(side="left", padx=(S(12), 0))
+        make_button(play, "Export...", self.ed_export).pack(side="right")
+        self.ed_format_var = tk.StringVar(value=self.prefs.get("export_format", "SRT"))
+        ttk.Combobox(play, textvariable=self.ed_format_var, values=["SRT", "VTT"],
+                     state="readonly", width=5, font=FONT(9)).pack(side="right", padx=(0, S(6)))
+        self._label(play, "Export as", sub=True, bg=PANEL).pack(side="right", padx=(0, S(6)))
 
         btns = tk.Frame(inner, bg=PANEL)
         btns.pack(fill="x", pady=(S(8), 0))
@@ -2071,6 +2088,37 @@ class AccurateSubtitles:
         else:
             self.ed_say(f"Applied: {len(cues)} cues on the timeline, every one on its exact frame, "
                         f"no gaps.", GOOD)
+
+    def ed_export(self):
+        """Save the cues as it stands here (applied or not) as SRT or VTT."""
+        job, cues = self.ed["job"], self.ed["cues"]
+        if not job or not cues:
+            self.ed_say("Load a timeline with subtitles first.", BAD)
+            return
+        fmt = self.ed_format_var.get() or "SRT"
+        ext = "." + fmt.lower()
+        folder = self.prefs.get("export_dir")
+        if not (folder and os.path.isdir(folder)):
+            folder = job["dirs"]["subtitles"] if os.path.isdir(job["dirs"]["subtitles"]) else None
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            title=f"Export subtitles as {fmt}", defaultextension=ext,
+            initialdir=folder, initialfile=sanitize(job["name"]) + ext,
+            filetypes=[(f"{fmt} subtitles", "*" + ext)], **ru.dialog_parent(self.root))
+        if not path:
+            return
+        if not path.lower().endswith(ext):
+            path += ext
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(subtitle_file_text(cues, job["fps"][0], job["fps"][1], fmt))
+        except OSError as e:
+            self.ed_say(f"Couldn't write {path}: {e}", BAD)
+            return
+        self.prefs.update(export_dir=os.path.dirname(path), export_format=fmt)
+        ru.write_json(PREFS_FILE, self.prefs)
+        note = " (includes edits not yet applied to Resolve)" if self.ed["dirty"] else ""
+        self.ed_say(f"Exported {len(cues)} cues to {path}{note}.", GOOD)
 
     def ed_select_and_say(self, i, text):
         self.ed_tree.selection_set(str(i))
